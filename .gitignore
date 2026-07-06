@@ -1,0 +1,8 @@
+config.local.json
+logs/
+.idea/
+*.log
+__pycache__/
+*.pyc
+config.secret.json
+*.iml
