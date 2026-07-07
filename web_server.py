@@ -2,6 +2,8 @@ import argparse
 import copy
 import json
 import mimetypes
+import os
+import subprocess
 import sys
 import threading
 import traceback
@@ -42,6 +44,9 @@ class Job:
     logs: list = field(default_factory=list)
     error: str = ""
     log_file: str = ""
+    cancel_requested: bool = False
+    current_process: object | None = field(default=None, repr=False, compare=False)
+    current_process_id: int | None = None
     created_at: str = field(default_factory=lambda: datetime.now().isoformat(timespec="seconds"))
     updated_at: str = field(default_factory=lambda: datetime.now().isoformat(timespec="seconds"))
 
@@ -71,6 +76,8 @@ class Job:
             "logs": self.logs,
             "error": self.error,
             "log_file": self.log_file,
+            "cancel_requested": self.cancel_requested,
+            "current_process_id": self.current_process_id,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
         }
@@ -88,12 +95,54 @@ class JobLogger:
         with jobs_lock:
             self.job.set_stage(key, title)
 
+    def set_process(self, process):
+        with jobs_lock:
+            self.job.current_process = process
+            self.job.current_process_id = process.pid
+            self.job.updated_at = datetime.now().isoformat(timespec="seconds")
+
+    def clear_process(self, process):
+        with jobs_lock:
+            if self.job.current_process is process:
+                self.job.current_process = None
+                self.job.current_process_id = None
+                self.job.updated_at = datetime.now().isoformat(timespec="seconds")
+
+    def is_cancel_requested(self):
+        with jobs_lock:
+            return self.job.cancel_requested
+
     def write(self, message):
         line = f"[{datetime.now().strftime('%H:%M:%S')}] {message}"
         with self.path.open("a", encoding="utf-8") as log_file:
             log_file.write(line + "\n")
         with jobs_lock:
             self.job.append_log(line)
+
+
+def terminate_process(process):
+    if process.poll() is not None:
+        return
+    if os.name == "nt":
+        subprocess.run(["taskkill", "/PID", str(process.pid), "/T", "/F"], capture_output=True, text=True)
+    else:
+        process.terminate()
+
+
+def cancel_job(job_id):
+    with jobs_lock:
+        job = jobs.get(job_id)
+        if not job:
+            raise ReleaseError("任务不存在")
+        if job.status != "running":
+            return job
+        job.cancel_requested = True
+        job.updated_at = datetime.now().isoformat(timespec="seconds")
+        process = job.current_process
+        job.append_log(f"[{datetime.now().strftime('%H:%M:%S')}] 收到停止请求")
+    if process:
+        terminate_process(process)
+    return job
 
 
 def read_request_json(handler):
@@ -261,10 +310,16 @@ def run_job(job_id):
     except Exception as exc:
         logger.write(traceback.format_exc())
         with jobs_lock:
-            job.status = "failed"
-            job.error = str(exc)
+            if job.cancel_requested:
+                job.status = "cancelled"
+                job.error = "任务已取消"
+            else:
+                job.status = "failed"
+                job.error = str(exc)
     finally:
         with jobs_lock:
+            job.current_process = None
+            job.current_process_id = None
             if current_job_id == job_id:
                 current_job_id = None
 
@@ -313,6 +368,11 @@ class ReleaseWebHandler(BaseHTTPRequestHandler):
             if path == "/api/jobs":
                 job = start_job(payload)
                 send_json(self, {"ok": True, "job": job.to_dict()}, status=202)
+                return
+            if path.startswith("/api/jobs/") and path.endswith("/cancel"):
+                job_id = path.split("/")[-2]
+                job = cancel_job(job_id)
+                send_json(self, {"ok": True, "job": job.to_dict()})
                 return
             if path == "/api/select-path":
                 selected = select_local_path(payload)

@@ -11,12 +11,13 @@ const STORAGE_KEY = 'release_harbor_html_fallback_v1';
       default_environment: 'pro',
       environment_replacements: [{ file: 'src\\main\\resources\\application.yml', regex: '(?m)^(\\s*active:\\s*).*$', replacement: '\\1{env}' }],
       deploy: { auth_type: 'key', host: '192.168.88.50', port: 22, user: 'root', private_key: 'C:\\Users\\Admin\\.ssh\\id_ed25519', remote_dir: '/www/nvisa', remote_filename: 'visaV3.jar', ssh_path: 'C:\\Windows\\System32\\OpenSSH\\ssh.exe', scp_path: 'C:\\Windows\\System32\\OpenSSH\\scp.exe' },
-      service: { stop_command: "PID_FILE=\"{remote_dir}/app.pid\"\nif [ -f \"$PID_FILE\" ]; then\n  PID=$(cat \"$PID_FILE\" 2>/dev/null || true)\n  if [ -n \"$PID\" ] && ps -p \"$PID\" >/dev/null 2>&1; then\n    kill -15 \"$PID\" 2>/dev/null || true\n    i=0\n    while [ $i -lt 60 ]; do\n      if ! ps -p \"$PID\" >/dev/null 2>&1; then\n        break\n      fi\n      sleep 1\n      i=$((i + 1))\n    done\n    kill -9 \"$PID\" 2>/dev/null || true\n  fi\n  rm -f \"$PID_FILE\"\nfi", start_command: "nohup java -jar {remote_path} --spring.profiles.active={env} > {remote_dir}/app.log 2>&1 & echo $! > {remote_dir}/app.pid", status_command: "PID_FILE=\"{remote_dir}/app.pid\"; if [ -f \"$PID_FILE\" ]; then PID=$(cat \"$PID_FILE\" 2>/dev/null || true); ps -p \"$PID\" -o pid,etime,cmd 2>/dev/null || true; else echo no-pid-file; fi", startup_wait_seconds: 3 }
+      service: { stop_command: "PID_FILE=\"{remote_dir}/app.pid\"\nif [ -f \"$PID_FILE\" ]; then\n  PID=$(cat \"$PID_FILE\" 2>/dev/null || true)\n  if [ -n \"$PID\" ] && ps -p \"$PID\" >/dev/null 2>&1; then\n    kill -15 \"$PID\" 2>/dev/null || true\n    i=0\n    while [ $i -lt 60 ]; do\n      if ! ps -p \"$PID\" >/dev/null 2>&1; then\n        break\n      fi\n      sleep 1\n      i=$((i + 1))\n    done\n    kill -9 \"$PID\" 2>/dev/null || true\n  fi\n  rm -f \"$PID_FILE\"\nfi", start_command: "nohup java -jar {remote_path} --spring.profiles.active={env} < /dev/null > {remote_dir}/app.log 2>&1 & echo $! > {remote_dir}/app.pid", status_command: "PID_FILE=\"{remote_dir}/app.pid\"; if [ -f \"$PID_FILE\" ]; then PID=$(cat \"$PID_FILE\" 2>/dev/null || true); ps -p \"$PID\" -o pid,etime,cmd 2>/dev/null || true; else echo no-pid-file; fi", startup_wait_seconds: 3 }
     };
     const defaultState = { selectedIndex: 0, projects: [structuredClone(defaultProject)] };
     let state = structuredClone(defaultState);
     let pollTimer = null;
     let lastLogCount = 0;
+    let lastErrorText = '';
     let activeJobId = null;
 
     const projectList = document.getElementById('projectList');
@@ -27,6 +28,7 @@ const STORAGE_KEY = 'release_harbor_html_fallback_v1';
     const progressText = document.getElementById('progressText');
     const stepList = document.getElementById('stepList');
     const actionButtons = ['validateBtn', 'saveBtn', 'uploadBtn', 'startBtn', 'fullBtn', 'deleteBtn', 'addProjectBtn'].map(id => document.getElementById(id));
+    const stopBtn = document.getElementById('stopBtn');
 
     async function api(path, options = {}) {
       if (!API_BASE) throw new Error('当前是 file:// 打开，只能使用本地缓存；请启动 web_server.py 后访问 http://127.0.0.1:8765');
@@ -122,7 +124,7 @@ const STORAGE_KEY = 'release_harbor_html_fallback_v1';
         packageType,
         title: 'jar 模板：PID 文件优雅停机 + java -jar 启动',
         stop_command: 'PID_FILE="{remote_dir}/app.pid"\nif [ -f "$PID_FILE" ]; then\n  PID=$(cat "$PID_FILE" 2>/dev/null || true)\n  if [ -n "$PID" ] && ps -p "$PID" >/dev/null 2>&1; then\n    kill -15 "$PID" 2>/dev/null || true\n    i=0\n    while [ $i -lt 60 ]; do\n      if ! ps -p "$PID" >/dev/null 2>&1; then\n        break\n      fi\n      sleep 1\n      i=$((i + 1))\n    done\n    kill -9 "$PID" 2>/dev/null || true\n  fi\n  rm -f "$PID_FILE"\nfi',
-        start_command: 'nohup java -jar {remote_path} --spring.profiles.active={env} > {remote_dir}/app.log 2>&1 & echo $! > {remote_dir}/app.pid',
+        start_command: 'nohup java -jar {remote_path} --spring.profiles.active={env} < /dev/null > {remote_dir}/app.log 2>&1 & echo $! > {remote_dir}/app.pid',
         status_command: 'PID_FILE="{remote_dir}/app.pid"; if [ -f "$PID_FILE" ]; then PID=$(cat "$PID_FILE" 2>/dev/null || true); ps -p "$PID" -o pid,etime,cmd 2>/dev/null || true; else echo no-pid-file; fi',
         startup_wait_seconds: 3
       };
@@ -350,6 +352,7 @@ const STORAGE_KEY = 'release_harbor_html_fallback_v1';
       const project = currentProject();
       setRunning(true);
       lastLogCount = 0;
+      lastErrorText = '';
       activeJobId = null;
       renderProgress(fallbackSteps(mode), 0, 'running');
       try {
@@ -359,6 +362,7 @@ const STORAGE_KEY = 'release_harbor_html_fallback_v1';
         });
         activeJobId = payload.job.id;
         renderJob(payload.job);
+        setRunning(true);
         pollTimer = setInterval(() => pollJob(activeJobId), 1000);
       } catch (error) {
         setRunning(false);
@@ -371,15 +375,18 @@ const STORAGE_KEY = 'release_harbor_html_fallback_v1';
       try {
         const payload = await api(`/api/jobs/${jobId}`);
         renderJob(payload.job);
-        if (['success', 'failed'].includes(payload.job.status)) {
+        if (['success', 'failed', 'cancelled'].includes(payload.job.status)) {
           clearInterval(pollTimer);
           pollTimer = null;
+          activeJobId = null;
           setRunning(false);
-          setBadge(payload.job.status === 'success' ? '执行完成' : '执行失败', payload.job.status === 'success' ? 'ok' : 'warn');
+          const doneText = payload.job.status === 'success' ? '执行完成' : payload.job.status === 'cancelled' ? '已停止' : '执行失败';
+          setBadge(doneText, payload.job.status === 'success' ? 'ok' : 'warn');
         }
       } catch (error) {
         clearInterval(pollTimer);
         pollTimer = null;
+        activeJobId = null;
         setRunning(false);
         log(`读取任务状态失败: ${error.message}`);
       }
@@ -389,7 +396,23 @@ const STORAGE_KEY = 'release_harbor_html_fallback_v1';
       renderProgress(job.steps || [], job.active_index ?? 0, job.status);
       (job.logs || []).slice(lastLogCount).forEach(line => appendLogLine(line));
       lastLogCount = (job.logs || []).length;
-      if (job.error) log(`任务错误: ${job.error}`);
+      if (job.error && job.error !== lastErrorText) {
+        lastErrorText = job.error;
+        log(`任务错误: ${job.error}`);
+      }
+    }
+
+    async function stopJob() {
+      if (!activeJobId) return;
+      stopBtn.disabled = true;
+      log('正在停止当前任务...');
+      try {
+        const payload = await api(`/api/jobs/${activeJobId}/cancel`, { method: 'POST', body: JSON.stringify({}) });
+        renderJob(payload.job);
+      } catch (error) {
+        log(`停止任务失败: ${error.message}`);
+        setRunning(true);
+      }
     }
 
     function addProject() {
@@ -423,6 +446,7 @@ const STORAGE_KEY = 'release_harbor_html_fallback_v1';
 
     function setRunning(running) {
       actionButtons.forEach(button => { if (button) button.disabled = running; });
+      if (stopBtn) stopBtn.disabled = !running || !activeJobId;
     }
 
     function setBadge(text, type) {
@@ -450,6 +474,7 @@ const STORAGE_KEY = 'release_harbor_html_fallback_v1';
     document.getElementById('uploadBtn').addEventListener('click', () => runFlow('upload'));
     document.getElementById('startBtn').addEventListener('click', () => runFlow('start'));
     document.getElementById('fullBtn').addEventListener('click', () => runFlow('full'));
+    stopBtn.addEventListener('click', stopJob);
     document.getElementById('applyTemplateBtn').addEventListener('click', applyServiceTemplate);
     document.getElementById('clearLogBtn').addEventListener('click', () => logOutput.textContent = '');
     document.getElementById('copyConfigBtn').addEventListener('click', copyConfig);

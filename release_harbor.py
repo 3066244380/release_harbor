@@ -292,7 +292,14 @@ def format_command(command):
     return " ".join(masked)
 
 
+def logger_cancel_requested(logger):
+    checker = getattr(logger, "is_cancel_requested", None)
+    return bool(checker and checker())
+
+
 def run_process(command, logger, cwd=None, encoding="gbk"):
+    if logger_cancel_requested(logger):
+        raise ReleaseError("任务已取消")
     logger.write(f"执行命令: {format_command(command)}")
     process = subprocess.Popen(
         [str(item) for item in command],
@@ -303,9 +310,19 @@ def run_process(command, logger, cwd=None, encoding="gbk"):
         encoding=encoding,
         errors="replace",
     )
-    for line in process.stdout:
-        logger.write(line.rstrip())
-    code = process.wait()
+    set_process = getattr(logger, "set_process", None)
+    clear_process = getattr(logger, "clear_process", None)
+    if set_process:
+        set_process(process)
+    try:
+        for line in process.stdout:
+            logger.write(line.rstrip())
+        code = process.wait()
+    finally:
+        if clear_process:
+            clear_process(process)
+    if logger_cancel_requested(logger):
+        raise ReleaseError("任务已取消")
     if code != 0:
         raise ReleaseError(f"命令执行失败，退出码: {code}")
 

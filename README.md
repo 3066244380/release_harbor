@@ -149,7 +149,7 @@ http://127.0.0.1:8765/
 当前默认启动命令会写入 PID 文件：
 
 ```sh
-nohup java -jar {remote_path} --spring.profiles.active={env} > {remote_dir}/app.log 2>&1 & echo $! > {remote_dir}/app.pid
+nohup java -jar {remote_path} --spring.profiles.active={env} < /dev/null > {remote_dir}/app.log 2>&1 & echo $! > {remote_dir}/app.pid
 ```
 
 默认停机命令读取 `{remote_dir}/app.pid`，先发送 `kill -15`，最多等待 60 秒，仍未退出时再发送 `kill -9` 兜底。

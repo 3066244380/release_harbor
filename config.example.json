@@ -37,7 +37,7 @@
       },
       "service": {
         "stop_command": "PID_FILE=\"{remote_dir}/app.pid\"\nif [ -f \"$PID_FILE\" ]; then\n  PID=$(cat \"$PID_FILE\" 2>/dev/null || true)\n  if [ -n \"$PID\" ] && ps -p \"$PID\" >/dev/null 2>&1; then\n    kill -15 \"$PID\" 2>/dev/null || true\n    i=0\n    while [ $i -lt 60 ]; do\n      if ! ps -p \"$PID\" >/dev/null 2>&1; then\n        break\n      fi\n      sleep 1\n      i=$((i + 1))\n    done\n    kill -9 \"$PID\" 2>/dev/null || true\n  fi\n  rm -f \"$PID_FILE\"\nfi",
-        "start_command": "nohup java -jar {remote_path} --spring.profiles.active={env} > {remote_dir}/app.log 2>&1 & echo $! > {remote_dir}/app.pid",
+        "start_command": "nohup java -jar {remote_path} --spring.profiles.active={env} < /dev/null > {remote_dir}/app.log 2>&1 & echo $! > {remote_dir}/app.pid",
         "status_command": "PID_FILE=\"{remote_dir}/app.pid\"; if [ -f \"$PID_FILE\" ]; then PID=$(cat \"$PID_FILE\" 2>/dev/null || true); ps -p \"$PID\" -o pid,etime,cmd 2>/dev/null || true; else echo no-pid-file; fi",
         "startup_wait_seconds": 3
       },
