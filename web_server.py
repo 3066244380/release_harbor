@@ -196,6 +196,11 @@ def iter_deploy_blocks(data):
         deploy = project.get("deploy")
         if isinstance(deploy, dict):
             yield deploy
+        env_configs = project.get("environment_configs")
+        if isinstance(env_configs, dict):
+            for env_config in env_configs.values():
+                if isinstance(env_config, dict) and isinstance(env_config.get("deploy"), dict):
+                    yield env_config["deploy"]
 
 
 def payload_to_config(payload):
@@ -276,7 +281,7 @@ def start_job(payload):
         raise ReleaseError("env_name 不能为空")
 
     config_file = release_harbor.load_config()
-    errors = release_harbor.validate_config(config_file, mode=mode)
+    errors = release_harbor.validate_config(config_file, mode=mode, project_name=project_name, env_name=env_name)
     if errors:
         raise ReleaseError("; ".join(errors))
 
@@ -360,9 +365,11 @@ class ReleaseWebHandler(BaseHTTPRequestHandler):
                 return
             if path == "/api/check":
                 mode = str(payload.get("mode") or "upload")
+                project_name = str(payload.get("project_name") or "").strip() or None
+                env_name = str(payload.get("env_name") or "").strip() or None
                 data = payload_to_config(payload) if "config" in payload or "projects" in payload else load_public_config()[1]
                 config_file = merged_config_for_validation(data)
-                errors = release_harbor.validate_config(config_file, mode=mode)
+                errors = release_harbor.validate_config(config_file, mode=mode, project_name=project_name, env_name=env_name)
                 send_json(self, {"ok": not bool(errors), "errors": errors})
                 return
             if path == "/api/jobs":

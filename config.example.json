@@ -41,6 +41,26 @@
         "status_command": "PID_FILE=\"{remote_dir}/app.pid\"; if [ -f \"$PID_FILE\" ]; then PID=$(cat \"$PID_FILE\" 2>/dev/null || true); ps -p \"$PID\" -o pid,etime,cmd 2>/dev/null || true; else echo no-pid-file; fi",
         "startup_wait_seconds": 3
       },
+      "environment_configs": {
+        "dev": {
+          "deploy": {
+            "host": "dev.server.host",
+            "remote_dir": "/www/visa-dev"
+          }
+        },
+        "test": {
+          "deploy": {
+            "host": "test.server.host",
+            "remote_dir": "/www/visa-test"
+          }
+        },
+        "pro": {
+          "deploy": {
+            "host": "pro.server.host",
+            "remote_dir": "/www/visa"
+          }
+        }
+      },
       "description": "签证业务后台 API 服务"
     }
   ]
