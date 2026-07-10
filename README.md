@@ -4,6 +4,46 @@
 
 Release Harbor 发布港是一个本地 H5 发布工作台，用于通过页面配置项目发布流程，并由 Python 后端执行真实操作：切换环境配置、执行 Maven 打包、备份服务器旧包、上传新 jar，并通过 PID 文件方式停止和启动服务。
 
+## 界面预览
+
+系统总览一屏展示项目列表、操作区、配置区和日志入口，常用发布动作都集中在工作台中。
+
+![系统总览](pic/overview.png)基础配置用于维护项目路径、构建命令、构建产物路径和包类型等核心字段。
+
+![基础配置](pic/base.png)
+
+环境配置用于维护 dev、test、pro 等环境列表，以及打包前后的环境文件替换规则。
+
+![环境配置](pic/env.png)
+
+
+
+![只打包流程](pic/build.png)
+
+配置校验用于检查本地路径、构建命令、SSH 配置和服务命令等关键项是否可用。
+
+![上传已有包](pic/upload.png)
+
+打包上传流程用于重新构建后上传产物，适合需要确保本地包与当前环境一致的发布场景。
+
+![打包上传流程](pic/upload2.png)
+
+服务启停用于维护远程停止、启动和状态检查命令。
+
+![服务启停](pic/stop-start.png)
+
+服务命令模板、环境替换和发布控制区域分开展示，细节配置也能看得很清楚。
+
+![服务控制与环境替换](pic/service-control.png)
+
+只打包流程用于在本地切换环境并执行构建，不上传到远程服务器。
+
+![配置校验](pic/check.png)
+
+执行进度与日志用于查看发布步骤状态、实时输出和失败原因。
+
+![执行进度与日志](pic/process-log.png)
+
 当前推荐入口是本地 Web 页面：
 
 ```text
@@ -18,8 +58,8 @@ http://127.0.0.1:8765/
 
 - `release_harbor.py`：核心打包、上传、远程启停逻辑，`web_server.py` 会引用其中的函数。
 - `web_server.py`：本地 HTTP 后端，负责提供 H5 页面和 API 接口。
-- `web/index.html`：H5 页面结构。
-- `web/app.js`：H5 页面交互逻辑。
+- `frontend/`：Vue 3 + Vite 前端源码，修改页面时优先改这里。
+- `web/`：Vue 构建后的静态页面，`web_server.py` 会直接托管这个目录。
 - `config.example.json`：可迁移的配置模板。
 - `config.secret.example.json`：账号密码模式的敏感配置模板。
 - `.gitignore`：忽略本机配置、日志和缓存。
@@ -92,9 +132,36 @@ http://127.0.0.1:8765/
 
    - `校验配置`：检查本地路径、构建命令、SSH 配置等是否可用。
    - `保存配置`：写入 `config.local.json`。
+   - `只打包`：切换环境、Maven 打包、检查构建产物，不上传服务器。
+   - `上传现有包`：不重新打包，直接备份服务器旧包并上传当前构建产物。
    - `打包上传`：切换环境、Maven 打包、备份旧包、上传新包。
    - `启动`：只执行远程停机、启动、等待和状态检查。
    - `上传并启动`：完整执行打包、上传、停机、启动流程。
+
+## 前端开发
+
+页面源码在 `frontend/`，使用 Vue 3 + Vite。Python 后端仍然托管 `web/` 目录，前端构建后会输出到 `web/`。
+
+首次开发前安装依赖：
+
+```powershell
+cd E:\work\tools\release_harbor\frontend
+pnpm install
+```
+
+开发调试：
+
+```powershell
+pnpm run dev
+```
+
+生产构建：
+
+```powershell
+pnpm run build
+```
+
+构建成功后，重新启动 `web_server.py` 或刷新 `http://127.0.0.1:8765/` 即可看到新页面。
 
 ## 配置说明
 
@@ -125,6 +192,34 @@ http://127.0.0.1:8765/
 - `remote_filename`：上传后的真实文件名，例如 `visaV3.jar`。
 - `ssh_path` / `scp_path`：Windows OpenSSH 命令路径。
 
+### 环境专属配置
+
+如果 `dev`、`test`、`pro` 对应不同服务器或目录，可以使用 `environment_configs` 为每个环境覆盖上传和服务配置。执行时会先读取项目默认 `deploy` / `service`，再叠加当前环境的覆盖字段。
+
+```json
+{
+  "environment_configs": {
+    "dev": {
+      "deploy": {
+        "host": "dev.server.host",
+        "remote_dir": "/www/visa-dev"
+      }
+    },
+    "test": {
+      "deploy": {
+        "host": "test.server.host",
+        "remote_dir": "/www/visa-test"
+      },
+      "service": {
+        "startup_wait_seconds": 5
+      }
+    }
+  }
+}
+```
+
+上面示例中，未写的字段会继承项目默认配置，例如 `user`、`private_key`、`remote_filename`。页面里的“服务器上传”和“服务控制”都可以选择正在编辑的环境。
+
 ### 服务命令占位符
 
 服务停机、启动、状态检查命令支持以下占位符，执行前由后端替换：
@@ -139,7 +234,7 @@ http://127.0.0.1:8765/
 当前默认启动命令会写入 PID 文件：
 
 ```sh
-nohup java -jar {remote_path} --spring.profiles.active={env} > {remote_dir}/app.log 2>&1 & echo $! > {remote_dir}/app.pid
+nohup java -jar {remote_path} --spring.profiles.active={env} < /dev/null > {remote_dir}/app.log 2>&1 & echo $! > {remote_dir}/app.pid
 ```
 
 默认停机命令读取 `{remote_dir}/app.pid`，先发送 `kill -15`，最多等待 60 秒，仍未退出时再发送 `kill -9` 兜底。
@@ -160,6 +255,22 @@ rm -rf {remote_dir}/{war_context}
 ```
 
 ## 执行逻辑
+
+`只打包` 流程：
+
+1. 校验配置。
+2. 按环境替换规则临时切换配置。
+3. 执行 Maven 打包命令。
+4. 检查构建产物是否存在。
+5. 恢复本地环境配置。
+
+`上传现有包` 流程：
+
+1. 校验配置。
+2. 检查构建产物是否存在。
+3. 远程创建目标目录。
+4. 如远程已有同名 jar，备份为 `xxx.jar.bak_yyyyMMddHHmmss`。
+5. 通过 `scp` 上传新 jar。
 
 `打包上传` 流程：
 
@@ -309,10 +420,6 @@ python E:\work\tools\release_harbor\web_server.py
 ### 退出码 `4294967295`
 
 在 Windows OpenSSH 场景下通常表示远程 SSH 命令异常中断。常见原因包括远程命令杀掉了自己的 SSH 会话、认证失败、known_hosts 问题、远程 shell 命令语法错误等。需要结合日志中“执行命令”后面的输出判断。
-
-### `[v]isaV3.jar` 是什么
-
-早期版本曾用过这种正则技巧来避免 `pgrep/pkill` 匹配自身。当前版本已改为 PID 文件方式，不再使用 `[v]isaV3.jar`。
 
 ## 安全说明
 

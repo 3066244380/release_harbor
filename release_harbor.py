@@ -115,9 +115,34 @@ def default_pscp_path():
     return shutil.which("pscp") or r"D:\tools\putty\pscp.exe"
 
 
-def get_project_deploy(project, data):
-    deploy = project.get("deploy") or data.get("deploy") or {}
-    return deploy if isinstance(deploy, dict) else {}
+def merge_environment_config(base, override):
+    merged = {}
+    if isinstance(base, dict):
+        merged.update(base)
+    if isinstance(override, dict):
+        merged.update(override)
+    return merged
+
+
+def get_project_env_config(project, env_name=None):
+    env = env_name or project.get("default_environment")
+    env_configs = project.get("environment_configs") or {}
+    if not env or not isinstance(env_configs, dict):
+        return {}
+    env_config = env_configs.get(env) or {}
+    return env_config if isinstance(env_config, dict) else {}
+
+
+def get_project_deploy(project, data, env_name=None):
+    base = merge_environment_config(data.get("deploy"), project.get("deploy"))
+    env_deploy = get_project_env_config(project, env_name).get("deploy")
+    return merge_environment_config(base, env_deploy)
+
+
+def get_project_service(project, env_name=None):
+    service = project.get("service") or {}
+    env_service = get_project_env_config(project, env_name).get("service")
+    return merge_environment_config(service, env_service)
 
 
 def deploy_auth_type(deploy):
@@ -129,6 +154,18 @@ def get_deploy_password(deploy):
 
 
 JOB_STEPS = {
+    "build": [
+        {"key": "validate", "title": "校验配置"},
+        {"key": "env", "title": "切换环境"},
+        {"key": "build", "title": "打包"},
+        {"key": "done", "title": "完成"},
+    ],
+    "deploy": [
+        {"key": "validate", "title": "校验配置"},
+        {"key": "backup", "title": "备份旧包"},
+        {"key": "upload", "title": "上传新包"},
+        {"key": "done", "title": "完成"},
+    ],
     "upload": [
         {"key": "validate", "title": "校验配置"},
         {"key": "env", "title": "切换环境"},
@@ -169,14 +206,31 @@ def set_stage(logger, key, title=None):
         logger.set_stage(key, title)
 
 
-def validate_config(config_file, mode="upload"):
+def effective_env_name(project, env_name=None):
+    if env_name:
+        return env_name
+    environments = project.get("environments") or []
+    return project.get("default_environment") or (environments[0] if environments else None)
+
+
+def env_config_prefix(prefix, project, env_name, key):
+    env_config = get_project_env_config(project, env_name)
+    if env_name and isinstance(env_config.get(key), dict):
+        return f"{prefix}.environment_configs.{env_name}.{key}"
+    return f"{prefix}.{key}"
+
+
+def validate_config(config_file, mode="upload", project_name=None, env_name=None):
     data = config_file.data
     errors = []
     if not isinstance(data.get("projects"), list) or not data["projects"]:
         errors.append("projects 至少需要配置一个项目")
 
     for index, project in enumerate(data.get("projects", []), start=1):
+        if project_name and project.get("name") != project_name:
+            continue
         prefix = f"projects[{index}]"
+        active_env = effective_env_name(project, env_name)
         if not project.get("name"):
             errors.append(f"{prefix}.name 不能为空")
         if not project.get("path"):
@@ -200,40 +254,41 @@ def validate_config(config_file, mode="upload"):
             if "replacement" not in replacement:
                 errors.append(f"{prefix}.environment_replacements.replacement 不能为空")
 
-        deploy = get_project_deploy(project, data)
-        deploy_prefix = f"{prefix}.deploy"
-        for key in ["host", "user", "remote_dir"]:
-            if not deploy.get(key):
-                errors.append(f"{deploy_prefix}.{key} 不能为空")
-        auth_type = deploy_auth_type(deploy)
-        if auth_type == "password":
-            if not get_deploy_password(deploy):
-                errors.append(f"{deploy_prefix}.password/password_env 不能为空")
-            plink_path = command_path(deploy.get("plink_path")) or default_plink_path()
-            pscp_path = command_path(deploy.get("pscp_path")) or default_pscp_path()
-            if not Path(plink_path).exists():
-                errors.append(f"{deploy_prefix}.plink_path 不存在: {plink_path}")
-            if not Path(pscp_path).exists():
-                errors.append(f"{deploy_prefix}.pscp_path 不存在: {pscp_path}")
-        elif auth_type == "key":
-            if not deploy.get("private_key"):
-                errors.append(f"{deploy_prefix}.private_key 不能为空")
+        if mode in ("deploy", "upload", "start", "full"):
+            deploy = get_project_deploy(project, data, active_env)
+            deploy_prefix = env_config_prefix(prefix, project, active_env, "deploy")
+            for key in ["host", "user", "remote_dir"]:
+                if not deploy.get(key):
+                    errors.append(f"{deploy_prefix}.{key} 不能为空")
+            auth_type = deploy_auth_type(deploy)
+            if auth_type == "password":
+                if not get_deploy_password(deploy):
+                    errors.append(f"{deploy_prefix}.password/password_env 不能为空")
+                plink_path = command_path(deploy.get("plink_path")) or default_plink_path()
+                pscp_path = command_path(deploy.get("pscp_path")) or default_pscp_path()
+                if not Path(plink_path).exists():
+                    errors.append(f"{deploy_prefix}.plink_path 不存在: {plink_path}")
+                if not Path(pscp_path).exists():
+                    errors.append(f"{deploy_prefix}.pscp_path 不存在: {pscp_path}")
+            elif auth_type == "key":
+                if not deploy.get("private_key"):
+                    errors.append(f"{deploy_prefix}.private_key 不能为空")
+                else:
+                    key_path = resolve_path(config_file.path, deploy["private_key"])
+                    if not key_path.exists():
+                        errors.append(f"{deploy_prefix}.private_key 不存在: {key_path}")
+                ssh_path = command_path(deploy.get("ssh_path")) or default_ssh_path()
+                scp_path = command_path(deploy.get("scp_path")) or default_scp_path()
+                if not Path(ssh_path).exists():
+                    errors.append(f"{deploy_prefix}.ssh_path 不存在: {ssh_path}")
+                if not Path(scp_path).exists():
+                    errors.append(f"{deploy_prefix}.scp_path 不存在: {scp_path}")
             else:
-                key_path = resolve_path(config_file.path, deploy["private_key"])
-                if not key_path.exists():
-                    errors.append(f"{deploy_prefix}.private_key 不存在: {key_path}")
-            ssh_path = command_path(deploy.get("ssh_path")) or default_ssh_path()
-            scp_path = command_path(deploy.get("scp_path")) or default_scp_path()
-            if not Path(ssh_path).exists():
-                errors.append(f"{deploy_prefix}.ssh_path 不存在: {ssh_path}")
-            if not Path(scp_path).exists():
-                errors.append(f"{deploy_prefix}.scp_path 不存在: {scp_path}")
-        else:
-            errors.append(f"{deploy_prefix}.auth_type 只支持 password 或 key")
+                errors.append(f"{deploy_prefix}.auth_type 只支持 password 或 key")
 
         if mode in ("start", "full"):
-            service = project.get("service") or {}
-            service_prefix = f"{prefix}.service"
+            service = get_project_service(project, active_env)
+            service_prefix = env_config_prefix(prefix, project, active_env, "service")
             if not service.get("stop_command"):
                 errors.append(f"{service_prefix}.stop_command 不能为空")
             if not service.get("start_command"):
@@ -292,7 +347,14 @@ def format_command(command):
     return " ".join(masked)
 
 
+def logger_cancel_requested(logger):
+    checker = getattr(logger, "is_cancel_requested", None)
+    return bool(checker and checker())
+
+
 def run_process(command, logger, cwd=None, encoding="gbk"):
+    if logger_cancel_requested(logger):
+        raise ReleaseError("任务已取消")
     logger.write(f"执行命令: {format_command(command)}")
     process = subprocess.Popen(
         [str(item) for item in command],
@@ -303,9 +365,19 @@ def run_process(command, logger, cwd=None, encoding="gbk"):
         encoding=encoding,
         errors="replace",
     )
-    for line in process.stdout:
-        logger.write(line.rstrip())
-    code = process.wait()
+    set_process = getattr(logger, "set_process", None)
+    clear_process = getattr(logger, "clear_process", None)
+    if set_process:
+        set_process(process)
+    try:
+        for line in process.stdout:
+            logger.write(line.rstrip())
+        code = process.wait()
+    finally:
+        if clear_process:
+            clear_process(process)
+    if logger_cancel_requested(logger):
+        raise ReleaseError("任务已取消")
     if code != 0:
         raise ReleaseError(f"命令执行失败，退出码: {code}")
 
@@ -393,8 +465,9 @@ def process_pattern(filename):
     return f"[{text[0]}]{text[1:]}"
 
 
-def infer_package_type(project):
-    for candidate in (project.get("artifact"), (project.get("deploy") or {}).get("remote_filename")):
+def infer_package_type(project, deploy=None):
+    deploy = deploy or project.get("deploy") or {}
+    for candidate in (project.get("artifact"), deploy.get("remote_filename")):
         suffix = Path(str(candidate or "")).suffix.lower()
         if suffix == ".war":
             return "war"
@@ -418,11 +491,11 @@ def infer_tomcat_home(remote_dir):
 
 
 def service_command_context(project, data, env_name=None):
-    deploy = get_project_deploy(project, data)
+    deploy = get_project_deploy(project, data, env_name)
     remote_dir = str(deploy.get("remote_dir", "")).rstrip("/")
     remote_filename = deploy.get("remote_filename") or Path(project.get("artifact", "")).name
     remote_path = remote_join(remote_dir, remote_filename) if remote_dir else remote_filename
-    package_type = infer_package_type(project)
+    package_type = infer_package_type(project, deploy)
     return {
         "package_type": package_type,
         "remote_dir": remote_dir,
@@ -447,7 +520,7 @@ def run_remote_command(config_file, project, command, logger, stage_key=None, st
         return
     if stage_key:
         set_stage(logger, stage_key, stage_title)
-    deploy = get_project_deploy(project, config_file.data)
+    deploy = get_project_deploy(project, config_file.data, env_name)
     command = render_service_command(command, service_command_context(project, config_file.data, env_name))
     host = deploy["host"]
     user = deploy["user"]
@@ -466,7 +539,7 @@ def run_remote_command(config_file, project, command, logger, stage_key=None, st
 
 
 def control_service(config_file, project, logger, env_name=None):
-    service = project.get("service") or {}
+    service = get_project_service(project, env_name)
     stop_command = service.get("stop_command")
     start_command = service.get("start_command")
     status_command = service.get("status_command")
@@ -486,8 +559,8 @@ def control_service(config_file, project, logger, env_name=None):
         logger.write("未配置状态检查命令，跳过")
 
 
-def deploy_artifact(config_file, project, artifact, logger):
-    deploy = get_project_deploy(project, config_file.data)
+def deploy_artifact(config_file, project, artifact, logger, env_name=None):
+    deploy = get_project_deploy(project, config_file.data, env_name)
     host = deploy["host"]
     user = deploy["user"]
     remote_dir = deploy["remote_dir"].rstrip("/")
@@ -518,17 +591,22 @@ def execute_release(config_file, project_name, env_name, logger, mode="upload"):
     start_time = time.time()
     try:
         set_stage(logger, "validate", "校验配置")
-        errors = validate_config(config_file, mode=mode)
+        errors = validate_config(config_file, mode=mode, project_name=project_name, env_name=env_name)
         if errors:
             raise ReleaseError("; ".join(errors))
-        if mode in ("upload", "full"):
+        if mode in ("build", "upload", "full"):
             set_stage(logger, "env", "切换环境")
             backups = apply_environment(project_path, project.get("environment_replacements", []), env_name, logger)
             run_build(project_path, build_command, logger)
             if not artifact.exists():
                 raise ReleaseError(f"找不到构建产物: {artifact}")
             logger.write(f"构建产物: {artifact} ({file_size_text(artifact)})")
-            deploy_artifact(config_file, project, artifact, logger)
+        if mode in ("deploy", "upload", "full"):
+            if not artifact.exists():
+                raise ReleaseError(f"找不到构建产物: {artifact}")
+            if mode == "deploy":
+                logger.write(f"使用已有构建产物: {artifact} ({file_size_text(artifact)})")
+            deploy_artifact(config_file, project, artifact, logger, env_name)
         if mode in ("start", "full"):
             control_service(config_file, project, logger, env_name)
         set_stage(logger, "done", "完成")
