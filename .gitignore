@@ -6,3 +6,6 @@ __pycache__/
 *.pyc
 config.secret.json
 *.iml
+node_modules/
+frontend/node_modules/
+.pnpm-store/
