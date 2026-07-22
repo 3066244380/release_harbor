@@ -36,6 +36,7 @@ class Job:
     env_name: str
     mode: str
     steps: list
+    replica_names: list | None = None
     status: str = "pending"
     active_key: str = "validate"
     active_title: str = "校验配置"
@@ -66,6 +67,7 @@ class Job:
             "id": self.id,
             "project_name": self.project_name,
             "env_name": self.env_name,
+            "replica_names": self.replica_names,
             "mode": self.mode,
             "status": self.status,
             "active_key": self.active_key,
@@ -201,6 +203,10 @@ def iter_deploy_blocks(data):
             for env_config in env_configs.values():
                 if isinstance(env_config, dict) and isinstance(env_config.get("deploy"), dict):
                     yield env_config["deploy"]
+                if isinstance(env_config, dict) and isinstance(env_config.get("replicas"), list):
+                    for replica in env_config["replicas"]:
+                        if isinstance(replica, dict) and isinstance(replica.get("deploy"), dict):
+                            yield replica["deploy"]
 
 
 def payload_to_config(payload):
@@ -218,6 +224,15 @@ def merged_config_for_validation(data):
     merged = copy.deepcopy(data)
     release_harbor.merge_secret_config(merged)
     return ConfigFile(LOCAL_CONFIG, merged, False)
+
+
+def parse_replica_names(payload):
+    names = payload.get("replica_names") if isinstance(payload, dict) else None
+    if names is None:
+        return None
+    if not isinstance(names, list):
+        raise ReleaseError("replica_names 必须是数组")
+    return [str(name).strip() for name in names if str(name).strip()]
 
 
 def save_config(payload):
@@ -250,6 +265,47 @@ def select_local_path(payload):
     return selected
 
 
+def run_log_command(payload):
+    project_name = str(payload.get("project_name") or "").strip()
+    env_name = str(payload.get("env_name") or "").strip()
+    replica_name = str(payload.get("replica_name") or "").strip()
+    command = str(payload.get("command") or "").strip()
+    work_dir = payload.get("work_dir")
+    if not project_name:
+        raise ReleaseError("project_name 不能为空")
+    if not env_name:
+        raise ReleaseError("env_name 不能为空")
+    if not command:
+        raise ReleaseError("日志查看命令不能为空")
+
+    data = payload_to_config(payload) if "config" in payload or "projects" in payload else load_public_config()[1]
+    config_file = merged_config_for_validation(data)
+    projects = {item.get("name"): item for item in config_file.data.get("projects", []) or []}
+    project = projects.get(project_name)
+    if not project:
+        raise ReleaseError(f"找不到项目: {project_name}")
+
+    replicas = release_harbor.get_project_replicas(project, env_name)
+    if replicas and not replica_name:
+        raise ReleaseError("请选择副本")
+    target_configs = release_harbor.get_deploy_targets(
+        project,
+        config_file.data,
+        env_name,
+        [replica_name] if replica_name else None,
+        require_selection=bool(replicas),
+    )
+    target_config = target_configs[0] if target_configs else None
+    return release_harbor.run_remote_log_command(
+        config_file,
+        project,
+        command,
+        env_name=env_name,
+        target_config=target_config,
+        work_dir_override=work_dir,
+    )
+
+
 def server_url(host, port):
     return f"http://{host}:{port}/"
 
@@ -273,6 +329,7 @@ def start_job(payload):
     project_name = str(payload.get("project_name") or "").strip()
     env_name = str(payload.get("env_name") or "").strip()
     mode = str(payload.get("mode") or "upload").strip()
+    replica_names = parse_replica_names(payload)
     if mode not in release_harbor.JOB_STEPS:
         raise ReleaseError(f"不支持的执行模式: {mode}")
     if not project_name:
@@ -281,7 +338,14 @@ def start_job(payload):
         raise ReleaseError("env_name 不能为空")
 
     config_file = release_harbor.load_config()
-    errors = release_harbor.validate_config(config_file, mode=mode, project_name=project_name, env_name=env_name)
+    errors = release_harbor.validate_config(
+        config_file,
+        mode=mode,
+        project_name=project_name,
+        env_name=env_name,
+        replica_names=replica_names,
+        require_replica_selection=mode in ("deploy", "upload", "start", "full"),
+    )
     if errors:
         raise ReleaseError("; ".join(errors))
 
@@ -289,7 +353,7 @@ def start_job(payload):
         if current_job_id and jobs.get(current_job_id) and jobs[current_job_id].status == "running":
             raise ReleaseError("已有任务正在执行，请等待完成")
         job_id = datetime.now().strftime("%Y%m%d%H%M%S%f")
-        job = Job(job_id, project_name, env_name, mode, release_harbor.get_job_steps(mode))
+        job = Job(job_id, project_name, env_name, mode, release_harbor.get_job_steps(mode), replica_names=replica_names)
         jobs[job_id] = job
         current_job_id = job_id
 
@@ -308,7 +372,7 @@ def run_job(job_id):
     try:
         logger.write(f"日志文件: {logger.path}")
         config_file = release_harbor.load_config()
-        release_harbor.execute_release(config_file, job.project_name, job.env_name, logger, mode=job.mode)
+        release_harbor.execute_release(config_file, job.project_name, job.env_name, logger, mode=job.mode, replica_names=job.replica_names)
         with jobs_lock:
             job.status = "success"
             job.set_stage("done", "完成")
@@ -367,9 +431,10 @@ class ReleaseWebHandler(BaseHTTPRequestHandler):
                 mode = str(payload.get("mode") or "upload")
                 project_name = str(payload.get("project_name") or "").strip() or None
                 env_name = str(payload.get("env_name") or "").strip() or None
+                replica_names = parse_replica_names(payload)
                 data = payload_to_config(payload) if "config" in payload or "projects" in payload else load_public_config()[1]
                 config_file = merged_config_for_validation(data)
-                errors = release_harbor.validate_config(config_file, mode=mode, project_name=project_name, env_name=env_name)
+                errors = release_harbor.validate_config(config_file, mode=mode, project_name=project_name, env_name=env_name, replica_names=replica_names)
                 send_json(self, {"ok": not bool(errors), "errors": errors})
                 return
             if path == "/api/jobs":
@@ -384,6 +449,10 @@ class ReleaseWebHandler(BaseHTTPRequestHandler):
             if path == "/api/select-path":
                 selected = select_local_path(payload)
                 send_json(self, {"ok": True, "path": selected, "cancelled": not bool(selected)})
+                return
+            if path == "/api/logs/command":
+                result = run_log_command(payload)
+                send_json(self, {"ok": True, "result": result})
                 return
             send_error_json(self, "接口不存在", status=404)
         except ReleaseError as exc:

@@ -220,6 +220,45 @@ pnpm run build
 
 上面示例中，未写的字段会继承项目默认配置，例如 `user`、`private_key`、`remote_filename`。页面里的“服务器上传”和“服务控制”都可以选择正在编辑的环境。
 
+### 环境多副本
+
+如果同一个环境部署在多台机器上，可以在该环境下配置 `replicas`。每个副本可以独立覆盖 `deploy` 和 `service`；未写字段会继续继承项目默认配置和当前环境配置。
+
+```json
+{
+  "environment_configs": {
+    "pro": {
+      "deploy": {
+        "remote_dir": "/www/visa"
+      },
+      "replicas": [
+        {
+          "name": "pro-1",
+          "deploy": {
+            "host": "pro-1.server.host"
+          },
+          "service": {
+            "start_command": "nohup java -jar {remote_path} --spring.profiles.active={env} > {remote_dir}/app-pro-1.log 2>&1 &"
+          }
+        },
+        {
+          "name": "pro-2",
+          "deploy": {
+            "host": "pro-2.server.host"
+          },
+          "service": {
+            "start_command": "nohup java -jar {remote_path} --spring.profiles.active={env} > {remote_dir}/app-pro-2.log 2>&1 &",
+            "startup_wait_seconds": 5
+          }
+        }
+      ]
+    }
+  }
+}
+```
+
+执行 `上传现有包`、`打包上传`、`启动`、`上传并启动` 时，确认弹窗会列出当前环境下的副本，默认全选，也可以只勾选其中一台做灰度。构建和环境替换只执行一次，上传和服务启停会按副本顺序逐台执行；每个副本会使用自己的服务命令，未配置的服务字段会从环境或项目配置继承。任一副本失败后任务会停止并在日志中标明失败副本。
+
 ### 服务命令占位符
 
 服务停机、启动、状态检查命令支持以下占位符，执行前由后端替换：
@@ -234,10 +273,10 @@ pnpm run build
 当前默认启动命令会写入 PID 文件：
 
 ```sh
-nohup java -jar {remote_path} --spring.profiles.active={env} < /dev/null > {remote_dir}/app.log 2>&1 & echo $! > {remote_dir}/app.pid
+nohup java -jar {remote_path} --spring.profiles.active={env} < /dev/null > {remote_dir}/nohup.out 2>&1 & echo $! > {remote_dir}/app.pid
 ```
 
-默认停机命令读取 `{remote_dir}/app.pid`，先发送 `kill -15`，最多等待 60 秒，仍未退出时再发送 `kill -9` 兜底。
+默认停机命令优先读取 `{remote_dir}/app.pid`，如果 PID 文件不存在或 PID 已失效，会按远程文件名查找进程；随后先发送 `kill -15`，最多等待 60 秒，仍未退出时再发送 `kill -9` 兜底。
 
 如果项目是 `war`，页面可以切换为 Tomcat 推荐模板。典型配置例如：
 

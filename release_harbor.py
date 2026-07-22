@@ -3,6 +3,7 @@ import json
 import os
 import queue
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -22,6 +23,12 @@ LOCAL_CONFIG = APP_DIR / "config.local.json"
 EXAMPLE_CONFIG = APP_DIR / "config.example.json"
 SECRET_CONFIG = APP_DIR / "config.secret.json"
 LOG_DIR = APP_DIR / "logs"
+MAX_REMOTE_LOG_OUTPUT = 200 * 1024
+REMOTE_COMMAND_TIMEOUTS = {
+    "stop": 120,
+    "start": 60,
+    "status": 30,
+}
 
 
 class ReleaseError(Exception):
@@ -139,10 +146,64 @@ def get_project_deploy(project, data, env_name=None):
     return merge_environment_config(base, env_deploy)
 
 
-def get_project_service(project, env_name=None):
+def get_project_service(project, env_name=None, replica=None):
     service = project.get("service") or {}
     env_service = get_project_env_config(project, env_name).get("service")
-    return merge_environment_config(service, env_service)
+    merged = merge_environment_config(service, env_service)
+    replica_service = replica.get("service") if isinstance(replica, dict) else None
+    return merge_environment_config(merged, replica_service)
+
+
+def get_project_log(project, env_name=None, replica=None):
+    log = project.get("log") or {}
+    env_log = get_project_env_config(project, env_name).get("log")
+    merged = merge_environment_config(log, env_log)
+    replica_log = replica.get("log") if isinstance(replica, dict) else None
+    return merge_environment_config(merged, replica_log)
+
+
+def get_project_replicas(project, env_name=None):
+    replicas = get_project_env_config(project, env_name).get("replicas") or []
+    return replicas if isinstance(replicas, list) else []
+
+
+def selected_replica_names(replica_names):
+    if replica_names is None:
+        return None
+    return [str(name).strip() for name in replica_names if str(name).strip()]
+
+
+def get_deploy_targets(project, data, env_name=None, replica_names=None, require_selection=False):
+    base = get_project_deploy(project, data, env_name)
+    replicas = get_project_replicas(project, env_name)
+    names = selected_replica_names(replica_names)
+    if not replicas:
+        return [{"name": "", "deploy": base, "replica": None}]
+    if require_selection and not names:
+        raise ReleaseError("请选择至少一个副本")
+
+    targets = []
+    wanted = set(names) if names is not None else None
+    seen = set()
+    for replica in replicas:
+        if not isinstance(replica, dict):
+            continue
+        name = str(replica.get("name") or "").strip()
+        if not name:
+            continue
+        if wanted is not None and name not in wanted:
+            continue
+        seen.add(name)
+        deploy = merge_environment_config(base, replica.get("deploy") or {})
+        targets.append({"name": name, "deploy": deploy, "replica": replica})
+
+    if wanted is not None:
+        missing = sorted(wanted - seen)
+        if missing:
+            raise ReleaseError(f"找不到副本: {', '.join(missing)}")
+    if require_selection and not targets:
+        raise ReleaseError("请选择至少一个副本")
+    return targets
 
 
 def deploy_auth_type(deploy):
@@ -220,7 +281,50 @@ def env_config_prefix(prefix, project, env_name, key):
     return f"{prefix}.{key}"
 
 
-def validate_config(config_file, mode="upload", project_name=None, env_name=None):
+def deploy_target_prefix(prefix, active_env, target, fallback_prefix):
+    if target.get("name"):
+        return f"{prefix}.environment_configs.{active_env}.replicas[{target['name']}].deploy"
+    return fallback_prefix
+
+
+def service_target_prefix(prefix, active_env, target, fallback_prefix):
+    if target.get("name"):
+        return f"{prefix}.environment_configs.{active_env}.replicas[{target['name']}].service"
+    return fallback_prefix
+
+
+def validate_deploy_block(config_file, deploy, deploy_prefix, errors):
+    for key in ["host", "user", "remote_dir"]:
+        if not deploy.get(key):
+            errors.append(f"{deploy_prefix}.{key} 不能为空")
+    auth_type = deploy_auth_type(deploy)
+    if auth_type == "password":
+        if not get_deploy_password(deploy):
+            errors.append(f"{deploy_prefix}.password/password_env 不能为空")
+        plink_path = command_path(deploy.get("plink_path")) or default_plink_path()
+        pscp_path = command_path(deploy.get("pscp_path")) or default_pscp_path()
+        if not Path(plink_path).exists():
+            errors.append(f"{deploy_prefix}.plink_path 不存在: {plink_path}")
+        if not Path(pscp_path).exists():
+            errors.append(f"{deploy_prefix}.pscp_path 不存在: {pscp_path}")
+    elif auth_type == "key":
+        if not deploy.get("private_key"):
+            errors.append(f"{deploy_prefix}.private_key 不能为空")
+        else:
+            key_path = resolve_path(config_file.path, deploy["private_key"])
+            if not key_path.exists():
+                errors.append(f"{deploy_prefix}.private_key 不存在: {key_path}")
+        ssh_path = command_path(deploy.get("ssh_path")) or default_ssh_path()
+        scp_path = command_path(deploy.get("scp_path")) or default_scp_path()
+        if not Path(ssh_path).exists():
+            errors.append(f"{deploy_prefix}.ssh_path 不存在: {ssh_path}")
+        if not Path(scp_path).exists():
+            errors.append(f"{deploy_prefix}.scp_path 不存在: {scp_path}")
+    else:
+        errors.append(f"{deploy_prefix}.auth_type 只支持 password 或 key")
+
+
+def validate_config(config_file, mode="upload", project_name=None, env_name=None, replica_names=None, require_replica_selection=False):
     data = config_file.data
     errors = []
     if not isinstance(data.get("projects"), list) or not data["projects"]:
@@ -255,8 +359,15 @@ def validate_config(config_file, mode="upload", project_name=None, env_name=None
                 errors.append(f"{prefix}.environment_replacements.replacement 不能为空")
 
         if mode in ("deploy", "upload", "start", "full"):
-            deploy = get_project_deploy(project, data, active_env)
-            deploy_prefix = env_config_prefix(prefix, project, active_env, "deploy")
+            try:
+                deploy_targets = get_deploy_targets(project, data, active_env, replica_names, require_replica_selection)
+            except ReleaseError as exc:
+                errors.append(str(exc))
+                deploy_targets = []
+            if not deploy_targets:
+                continue
+            deploy = deploy_targets[0]["deploy"]
+            deploy_prefix = deploy_target_prefix(prefix, active_env, deploy_targets[0], env_config_prefix(prefix, project, active_env, "deploy"))
             for key in ["host", "user", "remote_dir"]:
                 if not deploy.get(key):
                     errors.append(f"{deploy_prefix}.{key} 不能为空")
@@ -286,19 +397,24 @@ def validate_config(config_file, mode="upload", project_name=None, env_name=None
             else:
                 errors.append(f"{deploy_prefix}.auth_type 只支持 password 或 key")
 
+            for target in deploy_targets[1:]:
+                target_prefix = deploy_target_prefix(prefix, active_env, target, env_config_prefix(prefix, project, active_env, "deploy"))
+                validate_deploy_block(config_file, target["deploy"], target_prefix, errors)
+
         if mode in ("start", "full"):
-            service = get_project_service(project, active_env)
-            service_prefix = env_config_prefix(prefix, project, active_env, "service")
-            if not service.get("stop_command"):
-                errors.append(f"{service_prefix}.stop_command 不能为空")
-            if not service.get("start_command"):
-                errors.append(f"{service_prefix}.start_command 不能为空")
-            wait_seconds = service.get("startup_wait_seconds", 3)
-            try:
-                if int(wait_seconds) < 0:
-                    errors.append(f"{service_prefix}.startup_wait_seconds 不能小于 0")
-            except (TypeError, ValueError):
-                errors.append(f"{service_prefix}.startup_wait_seconds 必须是数字")
+            for target in deploy_targets:
+                service = get_project_service(project, active_env, target.get("replica"))
+                service_prefix = service_target_prefix(prefix, active_env, target, env_config_prefix(prefix, project, active_env, "service"))
+                if not service.get("stop_command"):
+                    errors.append(f"{service_prefix}.stop_command 不能为空")
+                if not service.get("start_command"):
+                    errors.append(f"{service_prefix}.start_command 不能为空")
+                wait_seconds = service.get("startup_wait_seconds", 3)
+                try:
+                    if int(wait_seconds) < 0:
+                        errors.append(f"{service_prefix}.startup_wait_seconds 不能小于 0")
+                except (TypeError, ValueError):
+                    errors.append(f"{service_prefix}.startup_wait_seconds 必须是数字")
     return errors
 
 
@@ -352,7 +468,16 @@ def logger_cancel_requested(logger):
     return bool(checker and checker())
 
 
-def run_process(command, logger, cwd=None, encoding="gbk"):
+def terminate_process_tree(process):
+    if process.poll() is not None:
+        return
+    if os.name == "nt":
+        subprocess.run(["taskkill", "/PID", str(process.pid), "/T", "/F"], capture_output=True, text=True)
+    else:
+        process.kill()
+
+
+def run_process(command, logger, cwd=None, encoding="gbk", timeout=None):
     if logger_cancel_requested(logger):
         raise ReleaseError("任务已取消")
     logger.write(f"执行命令: {format_command(command)}")
@@ -369,17 +494,87 @@ def run_process(command, logger, cwd=None, encoding="gbk"):
     clear_process = getattr(logger, "clear_process", None)
     if set_process:
         set_process(process)
+    output_queue = queue.Queue()
+
+    def read_output():
+        try:
+            for line in process.stdout:
+                output_queue.put(line)
+        finally:
+            output_queue.put(None)
+
+    reader = threading.Thread(target=read_output, daemon=True)
+    reader.start()
+    start_time = time.monotonic()
+    reader_done = False
+    timed_out = False
+    code = None
     try:
-        for line in process.stdout:
-            logger.write(line.rstrip())
-        code = process.wait()
+        while True:
+            try:
+                item = output_queue.get(timeout=0.1)
+                if item is None:
+                    reader_done = True
+                else:
+                    logger.write(item.rstrip())
+            except queue.Empty:
+                pass
+
+            code = process.poll()
+            if code is not None and reader_done:
+                break
+
+            if timeout is not None and time.monotonic() - start_time >= timeout:
+                timed_out = True
+                logger.write(f"命令执行超时（{timeout}s），正在终止进程")
+                terminate_process_tree(process)
+                try:
+                    code = process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    code = process.poll()
+                while True:
+                    try:
+                        item = output_queue.get_nowait()
+                    except queue.Empty:
+                        break
+                    if item is not None:
+                        logger.write(item.rstrip())
+                break
     finally:
         if clear_process:
             clear_process(process)
+    if timed_out:
+        raise ReleaseError(f"命令执行超时（{timeout}s）")
     if logger_cancel_requested(logger):
         raise ReleaseError("任务已取消")
     if code != 0:
         raise ReleaseError(f"命令执行失败，退出码: {code}")
+
+
+def run_process_capture(command, encoding="utf-8", timeout=30, max_output_chars=MAX_REMOTE_LOG_OUTPUT):
+    try:
+        completed = subprocess.run(
+            [str(item) for item in command],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding=encoding,
+            errors="replace",
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired as exc:
+        output = exc.stdout or ""
+        if isinstance(output, bytes):
+            output = output.decode(encoding, errors="replace")
+        if len(output) > max_output_chars:
+            output = output[:max_output_chars]
+        detail = f"\n{output.rstrip()}" if output else ""
+        raise ReleaseError(f"命令执行超时（{timeout}s）{detail}") from exc
+    output = completed.stdout or ""
+    truncated = len(output) > max_output_chars
+    if truncated:
+        output = output[:max_output_chars] + "\n...（输出超过 200KB，已截断）"
+    return {"exit_code": completed.returncode, "output": output, "truncated": truncated}
 
 
 def run_build(project_path, command, logger):
@@ -432,7 +627,7 @@ def deploy_with_key(config_file, deploy, artifact, remote_dir, remote_path, targ
     logger.write(f"使用私钥: {private_key}")
     remote_prepare = build_remote_prepare(remote_dir, remote_path)
     remote_command = "sh -lc " + sh_quote(remote_prepare)
-    ssh_command = [ssh_path, "-T", "-i", str(private_key), "-p", port, "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=accept-new", target, remote_command]
+    ssh_command = [ssh_path, "-n", "-T", "-i", str(private_key), "-p", port, "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=accept-new", target, remote_command]
     set_stage(logger, "backup", "备份旧包")
     run_process(ssh_command, logger, encoding="utf-8")
     remote_spec = f"{target}:{remote_path}"
@@ -490,13 +685,14 @@ def infer_tomcat_home(remote_dir):
     return text
 
 
-def service_command_context(project, data, env_name=None):
-    deploy = get_project_deploy(project, data, env_name)
+def service_command_context(project, data, env_name=None, deploy_override=None, service_override=None):
+    deploy = deploy_override or get_project_deploy(project, data, env_name)
+    service = service_override if isinstance(service_override, dict) else get_project_service(project, env_name)
     remote_dir = str(deploy.get("remote_dir", "")).rstrip("/")
     remote_filename = deploy.get("remote_filename") or Path(project.get("artifact", "")).name
     remote_path = remote_join(remote_dir, remote_filename) if remote_dir else remote_filename
     package_type = infer_package_type(project, deploy)
-    return {
+    context = {
         "package_type": package_type,
         "remote_dir": remote_dir,
         "remote_filename": remote_filename,
@@ -506,6 +702,19 @@ def service_command_context(project, data, env_name=None):
         "war_context": war_context_name(remote_filename),
         "env": env_name or project.get("default_environment", ""),
     }
+    default_work_dir = "{tomcat_home}" if package_type == "war" else "{remote_dir}"
+    context["service_work_dir"] = render_service_command(service.get("work_dir") or default_work_dir, context)
+    context["service_pid_file"] = render_service_command(service.get("pid_file") or "{service_work_dir}/app.pid", context)
+    context["service_process_pattern"] = render_service_command(service.get("process_pattern") or "{remote_process_pattern}", context)
+    return context
+
+
+def log_command_context(project, data, env_name=None, deploy_override=None, replica=None):
+    context = service_command_context(project, data, env_name, deploy_override)
+    log_config = get_project_log(project, env_name, replica)
+    work_dir = render_service_command(log_config.get("work_dir") or "{remote_dir}", context)
+    context["work_dir"] = work_dir
+    return context
 
 
 def render_service_command(command, context):
@@ -515,52 +724,298 @@ def render_service_command(command, context):
     return rendered
 
 
-def run_remote_command(config_file, project, command, logger, stage_key=None, stage_title=None, env_name=None):
+def remote_service_body(command, context):
+    work_dir = str(context.get("service_work_dir", "") or "").rstrip("/")
+    if not work_dir:
+        return command
+    return f"cd {sh_quote(work_dir)} && {command}"
+
+
+def split_log_pipeline(command):
+    segments = []
+    current = []
+    quote = ""
+    escaped = False
+    text = str(command)
+    if "`" in text:
+        raise ReleaseError("日志查看命令不允许使用反引号")
+    if "$(" in text:
+        raise ReleaseError("日志查看命令不允许使用 $()")
+    index = 0
+    while index < len(text):
+        char = text[index]
+        if escaped:
+            current.append(char)
+            escaped = False
+            index += 1
+            continue
+        if char == "\\":
+            current.append(char)
+            escaped = True
+            index += 1
+            continue
+        if quote:
+            current.append(char)
+            if char == quote:
+                quote = ""
+            index += 1
+            continue
+        if char in ("\n", "\r", ";", "&", "<", ">", "(", ")"):
+            raise ReleaseError(f"日志查看命令不允许使用控制符: {char}")
+        if char in ("'", '"'):
+            current.append(char)
+            quote = char
+            index += 1
+            continue
+        if char == "|":
+            if index + 1 < len(text) and text[index + 1] == "|":
+                raise ReleaseError("日志查看命令不允许使用 ||")
+            segment = "".join(current).strip()
+            if not segment:
+                raise ReleaseError("管道前缺少命令")
+            segments.append(segment)
+            current = []
+            index += 1
+            continue
+        current.append(char)
+        index += 1
+    if quote:
+        raise ReleaseError("日志查看命令引号未闭合")
+    segment = "".join(current).strip()
+    if segment:
+        segments.append(segment)
+    if not segments:
+        raise ReleaseError("日志查看命令不能为空")
+    return segments
+
+
+def shell_tokens(segment):
+    try:
+        tokens = shlex.split(segment, posix=True)
+    except ValueError as exc:
+        raise ReleaseError(f"日志查看命令解析失败: {exc}") from exc
+    if not tokens:
+        raise ReleaseError("管道中包含空命令")
+    return tokens
+
+
+def ensure_current_dir_arg(value):
+    text = str(value or "")
+    if not text or text == "-":
+        raise ReleaseError("文件名不能为空")
+    normalized = text.replace("\\", "/")
+    if normalized in (".", "./"):
+        return
+    while normalized.startswith("./"):
+        normalized = normalized[2:]
+    parts = [part for part in normalized.split("/") if part]
+    if normalized.startswith("/") or normalized.startswith("~") or ".." in parts or "/" in normalized:
+        raise ReleaseError(f"文件参数只能使用当前目录内文件: {value}")
+
+
+def option_has_short_flag(token, flags):
+    if not token.startswith("-") or token.startswith("--") or token == "-":
+        return False
+    return any(char in flags for char in token[1:])
+
+
+def validate_ls_tokens(tokens):
+    for token in tokens[1:]:
+        if token == "--recursive" or option_has_short_flag(token, {"R"}):
+            raise ReleaseError("日志查看不允许使用 ls -R")
+        if token.startswith("-"):
+            continue
+        ensure_current_dir_arg(token)
+
+
+def validate_tail_tokens(tokens):
+    has_file = False
+    skip_next = False
+    for token in tokens[1:]:
+        if skip_next:
+            skip_next = False
+            continue
+        if token in ("-f", "-F", "--follow") or token.startswith("--follow=") or option_has_short_flag(token, {"f", "F"}):
+            raise ReleaseError("日志查看不允许使用 tail -f")
+        if token in ("-n", "--lines", "-c", "--bytes"):
+            skip_next = True
+            continue
+        if token.startswith("--lines=") or token.startswith("--bytes=") or re.fullmatch(r"-\d+", token):
+            continue
+        if token.startswith("-"):
+            continue
+        ensure_current_dir_arg(token)
+        has_file = True
+    if not has_file:
+        raise ReleaseError("tail 必须指定当前目录内日志文件")
+
+
+def validate_grep_tokens(tokens, has_stdin):
+    pattern_seen = False
+    file_args = []
+    skip_next = False
+    for token in tokens[1:]:
+        if skip_next:
+            skip_next = False
+            continue
+        if token in ("-r", "-R", "--recursive", "--dereference-recursive") or option_has_short_flag(token, {"r", "R"}):
+            raise ReleaseError("日志查看不允许使用 grep 递归搜索")
+        if token in ("-f", "--file") or token.startswith("--file=") or option_has_short_flag(token, {"f"}):
+            raise ReleaseError("日志查看不允许使用 grep -f")
+        if token in ("-e", "--regexp"):
+            pattern_seen = True
+            skip_next = True
+            continue
+        if token in ("-A", "-B", "-C", "--after-context", "--before-context", "--context"):
+            skip_next = True
+            continue
+        if token.startswith("--regexp=") or token.startswith("--after-context=") or token.startswith("--before-context=") or token.startswith("--context="):
+            pattern_seen = True
+            continue
+        if token.startswith("-"):
+            continue
+        if not pattern_seen:
+            pattern_seen = True
+            continue
+        file_args.append(token)
+    if not pattern_seen:
+        raise ReleaseError("grep 必须指定搜索关键字")
+    if not has_stdin and not file_args:
+        raise ReleaseError("grep 直接执行时必须指定当前目录内日志文件")
+    for token in file_args:
+        ensure_current_dir_arg(token)
+
+
+def validate_remote_log_command(command):
+    segments = split_log_pipeline(command)
+    allowed = {"tail", "grep", "ls"}
+    for index, segment in enumerate(segments):
+        tokens = shell_tokens(segment)
+        command_name = tokens[0]
+        if "/" in command_name or command_name not in allowed:
+            raise ReleaseError(f"日志查看只允许 tail、grep、ls: {command_name}")
+        if command_name == "ls":
+            validate_ls_tokens(tokens)
+        elif command_name == "tail":
+            validate_tail_tokens(tokens)
+        elif command_name == "grep":
+            validate_grep_tokens(tokens, has_stdin=index > 0)
+    return segments
+
+
+def validate_log_deploy(config_file, deploy):
+    errors = []
+    if not deploy.get("host"):
+        errors.append("服务器地址不能为空")
+    if not deploy.get("user"):
+        errors.append("服务器用户不能为空")
+    auth_type = deploy_auth_type(deploy)
+    if auth_type == "password":
+        if not get_deploy_password(deploy):
+            errors.append("password/password_env 不能为空")
+    elif auth_type == "key":
+        if not deploy.get("private_key"):
+            errors.append("私钥路径不能为空")
+        else:
+            key_path = resolve_path(config_file.path, deploy["private_key"])
+            if not key_path.exists():
+                errors.append(f"私钥路径不存在: {key_path}")
+    else:
+        errors.append("auth_type 只支持 password 或 key")
+    if errors:
+        raise ReleaseError("; ".join(errors))
+
+
+def run_remote_command(config_file, project, command, logger, stage_key=None, stage_title=None, env_name=None, deploy_override=None, timeout=None, service_override=None):
     if not command:
         return
     if stage_key:
         set_stage(logger, stage_key, stage_title)
-    deploy = get_project_deploy(project, config_file.data, env_name)
-    command = render_service_command(command, service_command_context(project, config_file.data, env_name))
+    deploy = deploy_override or get_project_deploy(project, config_file.data, env_name)
+    context = service_command_context(project, config_file.data, env_name, deploy, service_override)
+    command = render_service_command(command, context)
+    command = remote_service_body(command, context)
     host = deploy["host"]
     user = deploy["user"]
     port = str(deploy.get("port", 22))
     target = f"{user}@{host}"
     remote_command = "sh -lc " + sh_quote(command)
+    timeout = REMOTE_COMMAND_TIMEOUTS.get(stage_key) if timeout is None else timeout
     logger.write(f"远程执行: {target}")
     if deploy_auth_type(deploy) == "password":
         password = get_deploy_password(deploy)
         plink_path = command_path(deploy.get("plink_path")) or default_plink_path()
-        run_process([plink_path, "-batch", "-ssh", "-P", port, "-pw", password, target, remote_command], logger, encoding="utf-8")
+        run_process([plink_path, "-batch", "-ssh", "-P", port, "-pw", password, target, remote_command], logger, encoding="utf-8", timeout=timeout)
     else:
         private_key = resolve_path(config_file.path, deploy["private_key"])
         ssh_path = command_path(deploy.get("ssh_path")) or default_ssh_path()
-        run_process([ssh_path, "-T", "-i", str(private_key), "-p", port, "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=accept-new", target, remote_command], logger, encoding="utf-8")
+        run_process([ssh_path, "-n", "-T", "-i", str(private_key), "-p", port, "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=accept-new", target, remote_command], logger, encoding="utf-8", timeout=timeout)
 
 
-def control_service(config_file, project, logger, env_name=None):
-    service = get_project_service(project, env_name)
+def run_remote_log_command(config_file, project, command, env_name=None, target_config=None, work_dir_override=None):
+    command = str(command or "").strip()
+    if not command:
+        raise ReleaseError("日志查看命令不能为空")
+    replica = target_config.get("replica") if target_config else None
+    deploy = target_config["deploy"] if target_config else get_project_deploy(project, config_file.data, env_name)
+    validate_log_deploy(config_file, deploy)
+    context = log_command_context(project, config_file.data, env_name, deploy, replica)
+    if work_dir_override is not None:
+        context["work_dir"] = render_service_command(str(work_dir_override), context)
+    rendered_command = render_service_command(command, context).strip()
+    validate_remote_log_command(rendered_command)
+    work_dir = context.get("work_dir") or ""
+    if not work_dir:
+        raise ReleaseError("服务器当前目录不能为空")
+    remote_body = f"cd {sh_quote(work_dir)} && {rendered_command}" if work_dir else rendered_command
+    host = deploy["host"]
+    user = deploy["user"]
+    port = str(deploy.get("port", 22))
+    target = f"{user}@{host}"
+    remote_command = "sh -lc " + sh_quote(remote_body)
+    if deploy_auth_type(deploy) == "password":
+        password = get_deploy_password(deploy)
+        plink_path = command_path(deploy.get("plink_path")) or default_plink_path()
+        result = run_process_capture([plink_path, "-batch", "-ssh", "-P", port, "-pw", password, target, remote_command], encoding="utf-8")
+    else:
+        private_key = resolve_path(config_file.path, deploy["private_key"])
+        ssh_path = command_path(deploy.get("ssh_path")) or default_ssh_path()
+        result = run_process_capture([ssh_path, "-n", "-T", "-i", str(private_key), "-p", port, "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=accept-new", target, remote_command], encoding="utf-8")
+    return {
+        "target": target,
+        "work_dir": work_dir,
+        "command": rendered_command,
+        "exit_code": result["exit_code"],
+        "output": result["output"],
+        "truncated": result.get("truncated", False),
+    }
+
+
+def control_service(config_file, project, logger, env_name=None, target_config=None):
+    replica = target_config.get("replica") if target_config else None
+    service = get_project_service(project, env_name, replica)
+    deploy = target_config["deploy"] if target_config else None
     stop_command = service.get("stop_command")
     start_command = service.get("start_command")
     status_command = service.get("status_command")
     wait_seconds = int(service.get("startup_wait_seconds", 3) or 0)
 
     logger.write("开始服务控制")
-    run_remote_command(config_file, project, stop_command, logger, "stop", "优雅停机")
-    run_remote_command(config_file, project, start_command, logger, "start", "启动服务")
+    run_remote_command(config_file, project, stop_command, logger, "stop", "优雅停机", env_name, deploy, service_override=service)
+    run_remote_command(config_file, project, start_command, logger, "start", "启动服务", env_name, deploy, service_override=service)
     set_stage(logger, "wait", "等待启动")
     logger.write(f"等待服务启动: {wait_seconds}s")
     if wait_seconds > 0:
         time.sleep(wait_seconds)
     if status_command:
-        run_remote_command(config_file, project, status_command, logger, "status", "状态检查")
+        run_remote_command(config_file, project, status_command, logger, "status", "状态检查", env_name, deploy, service_override=service)
     else:
         set_stage(logger, "status", "状态检查")
         logger.write("未配置状态检查命令，跳过")
 
 
-def deploy_artifact(config_file, project, artifact, logger, env_name=None):
-    deploy = get_project_deploy(project, config_file.data, env_name)
+def deploy_artifact(config_file, project, artifact, logger, env_name=None, target_config=None):
+    deploy = target_config["deploy"] if target_config else get_project_deploy(project, config_file.data, env_name)
     host = deploy["host"]
     user = deploy["user"]
     remote_dir = deploy["remote_dir"].rstrip("/")
@@ -568,6 +1023,8 @@ def deploy_artifact(config_file, project, artifact, logger, env_name=None):
     remote_path = remote_join(remote_dir, remote_filename)
     target = f"{user}@{host}"
 
+    if target_config and target_config.get("name"):
+        logger.write(f"目标副本: {target_config['name']}")
     logger.write(f"目标服务器: {target}:{remote_path}")
     if deploy_auth_type(deploy) == "password":
         deploy_with_password(deploy, artifact, remote_dir, remote_path, target, logger)
@@ -576,7 +1033,7 @@ def deploy_artifact(config_file, project, artifact, logger, env_name=None):
     logger.write("上传完成")
 
 
-def execute_release(config_file, project_name, env_name, logger, mode="upload"):
+def execute_release(config_file, project_name, env_name, logger, mode="upload", replica_names=None):
     if mode not in JOB_STEPS:
         raise ReleaseError(f"不支持的执行模式: {mode}")
     data = config_file.data
@@ -591,9 +1048,23 @@ def execute_release(config_file, project_name, env_name, logger, mode="upload"):
     start_time = time.time()
     try:
         set_stage(logger, "validate", "校验配置")
-        errors = validate_config(config_file, mode=mode, project_name=project_name, env_name=env_name)
+        errors = validate_config(
+            config_file,
+            mode=mode,
+            project_name=project_name,
+            env_name=env_name,
+            replica_names=replica_names,
+            require_replica_selection=mode in ("deploy", "upload", "start", "full"),
+        )
         if errors:
             raise ReleaseError("; ".join(errors))
+        deploy_targets = get_deploy_targets(
+            project,
+            data,
+            env_name,
+            replica_names,
+            require_selection=mode in ("deploy", "upload", "start", "full"),
+        )
         if mode in ("build", "upload", "full"):
             set_stage(logger, "env", "切换环境")
             backups = apply_environment(project_path, project.get("environment_replacements", []), env_name, logger)
@@ -606,9 +1077,13 @@ def execute_release(config_file, project_name, env_name, logger, mode="upload"):
                 raise ReleaseError(f"找不到构建产物: {artifact}")
             if mode == "deploy":
                 logger.write(f"使用已有构建产物: {artifact} ({file_size_text(artifact)})")
-            deploy_artifact(config_file, project, artifact, logger, env_name)
+            for target_config in deploy_targets:
+                deploy_artifact(config_file, project, artifact, logger, env_name, target_config)
         if mode in ("start", "full"):
-            control_service(config_file, project, logger, env_name)
+            for target_config in deploy_targets:
+                if target_config.get("name"):
+                    logger.write(f"开始控制副本: {target_config['name']}")
+                control_service(config_file, project, logger, env_name, target_config)
         set_stage(logger, "done", "完成")
         elapsed = time.time() - start_time
         logger.write(f"执行完成，用时 {elapsed:.1f}s")

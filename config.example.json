@@ -36,10 +36,13 @@
         "scp_path": "C:\\Windows\\System32\\OpenSSH\\scp.exe"
       },
       "service": {
-        "stop_command": "PID_FILE=\"{remote_dir}/app.pid\"\nif [ -f \"$PID_FILE\" ]; then\n  PID=$(cat \"$PID_FILE\" 2>/dev/null || true)\n  if [ -n \"$PID\" ] && ps -p \"$PID\" >/dev/null 2>&1; then\n    kill -15 \"$PID\" 2>/dev/null || true\n    i=0\n    while [ $i -lt 60 ]; do\n      if ! ps -p \"$PID\" >/dev/null 2>&1; then\n        break\n      fi\n      sleep 1\n      i=$((i + 1))\n    done\n    kill -9 \"$PID\" 2>/dev/null || true\n  fi\n  rm -f \"$PID_FILE\"\nfi",
-        "start_command": "nohup java -jar {remote_path} --spring.profiles.active={env} < /dev/null > {remote_dir}/app.log 2>&1 & echo $! > {remote_dir}/app.pid",
-        "status_command": "PID_FILE=\"{remote_dir}/app.pid\"; if [ -f \"$PID_FILE\" ]; then PID=$(cat \"$PID_FILE\" 2>/dev/null || true); ps -p \"$PID\" -o pid,etime,cmd 2>/dev/null || true; else echo no-pid-file; fi",
+        "stop_command": "PID_FILE=\"{remote_dir}/app.pid\"\nPID=\"\"\nif [ -f \"$PID_FILE\" ]; then\n  PID=$(cat \"$PID_FILE\" 2>/dev/null || true)\nfi\nif [ -z \"$PID\" ] || ! ps -p \"$PID\" >/dev/null 2>&1; then\n  PID=$(pgrep -f \"{remote_process_pattern}\" | head -n 1 || true)\nfi\nif [ -n \"$PID\" ] && ps -p \"$PID\" >/dev/null 2>&1; then\n  kill -15 \"$PID\" 2>/dev/null || true\n  i=0\n  while [ $i -lt 60 ]; do\n    if ! ps -p \"$PID\" >/dev/null 2>&1; then\n      break\n    fi\n    sleep 1\n    i=$((i + 1))\n  done\n  kill -9 \"$PID\" 2>/dev/null || true\nfi\nrm -f \"$PID_FILE\"",
+        "start_command": "nohup java -jar {remote_path} --spring.profiles.active={env} < /dev/null > {remote_dir}/nohup.out 2>&1 & echo $! > {remote_dir}/app.pid",
+        "status_command": "PID_FILE=\"{remote_dir}/app.pid\"\nPID=\"\"\nif [ -f \"$PID_FILE\" ]; then\n  PID=$(cat \"$PID_FILE\" 2>/dev/null || true)\nfi\nif [ -n \"$PID\" ] && ps -p \"$PID\" >/dev/null 2>&1; then\n  ps -p \"$PID\" -o pid,etime,cmd\nelse\n  pgrep -af \"{remote_process_pattern}\" || echo no-process\nfi",
         "startup_wait_seconds": 3
+      },
+      "log": {
+        "work_dir": "{remote_dir}"
       },
       "environment_configs": {
         "dev": {
@@ -58,7 +61,35 @@
           "deploy": {
             "host": "pro.server.host",
             "remote_dir": "/www/visa"
-          }
+          },
+          "replicas": [
+            {
+              "name": "pro-1",
+              "deploy": {
+                "host": "pro-1.server.host",
+                "remote_dir": "/www/visa"
+              },
+              "service": {
+                "stop_command": "PID_FILE=\"{remote_dir}/app.pid\"\nPID=\"\"\nif [ -f \"$PID_FILE\" ]; then\n  PID=$(cat \"$PID_FILE\" 2>/dev/null || true)\nfi\nif [ -z \"$PID\" ] || ! ps -p \"$PID\" >/dev/null 2>&1; then\n  PID=$(pgrep -f \"{remote_process_pattern}\" | head -n 1 || true)\nfi\nif [ -n \"$PID\" ] && ps -p \"$PID\" >/dev/null 2>&1; then\n  kill -15 \"$PID\" 2>/dev/null || true\n  i=0\n  while [ $i -lt 60 ]; do\n    if ! ps -p \"$PID\" >/dev/null 2>&1; then\n      break\n    fi\n    sleep 1\n    i=$((i + 1))\n  done\n  kill -9 \"$PID\" 2>/dev/null || true\nfi\nrm -f \"$PID_FILE\"",
+                "start_command": "nohup java -jar {remote_path} --spring.profiles.active={env} < /dev/null > {remote_dir}/app-pro-1.log 2>&1 & echo $! > {remote_dir}/app.pid",
+                "status_command": "PID_FILE=\"{remote_dir}/app.pid\"\nPID=\"\"\nif [ -f \"$PID_FILE\" ]; then\n  PID=$(cat \"$PID_FILE\" 2>/dev/null || true)\nfi\nif [ -n \"$PID\" ] && ps -p \"$PID\" >/dev/null 2>&1; then\n  ps -p \"$PID\" -o pid,etime,cmd\nelse\n  pgrep -af \"{remote_process_pattern}\" || echo no-process\nfi",
+                "startup_wait_seconds": 3
+              }
+            },
+            {
+              "name": "pro-2",
+              "deploy": {
+                "host": "pro-2.server.host",
+                "remote_dir": "/www/visa"
+              },
+              "service": {
+                "stop_command": "PID_FILE=\"{remote_dir}/app.pid\"\nPID=\"\"\nif [ -f \"$PID_FILE\" ]; then\n  PID=$(cat \"$PID_FILE\" 2>/dev/null || true)\nfi\nif [ -z \"$PID\" ] || ! ps -p \"$PID\" >/dev/null 2>&1; then\n  PID=$(pgrep -f \"{remote_process_pattern}\" | head -n 1 || true)\nfi\nif [ -n \"$PID\" ] && ps -p \"$PID\" >/dev/null 2>&1; then\n  kill -15 \"$PID\" 2>/dev/null || true\n  i=0\n  while [ $i -lt 60 ]; do\n    if ! ps -p \"$PID\" >/dev/null 2>&1; then\n      break\n    fi\n    sleep 1\n    i=$((i + 1))\n  done\n  kill -9 \"$PID\" 2>/dev/null || true\nfi\nrm -f \"$PID_FILE\"",
+                "start_command": "nohup java -jar {remote_path} --spring.profiles.active={env} < /dev/null > {remote_dir}/app-pro-2.log 2>&1 & echo $! > {remote_dir}/app.pid",
+                "status_command": "PID_FILE=\"{remote_dir}/app.pid\"\nPID=\"\"\nif [ -f \"$PID_FILE\" ]; then\n  PID=$(cat \"$PID_FILE\" 2>/dev/null || true)\nfi\nif [ -n \"$PID\" ] && ps -p \"$PID\" >/dev/null 2>&1; then\n  ps -p \"$PID\" -o pid,etime,cmd\nelse\n  pgrep -af \"{remote_process_pattern}\" || echo no-process\nfi",
+                "startup_wait_seconds": 5
+              }
+            }
+          ]
         }
       },
       "description": "签证业务后台 API 服务"
