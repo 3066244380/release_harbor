@@ -21,7 +21,7 @@ from release_harbor import ConfigFile, EXAMPLE_CONFIG, LOCAL_CONFIG, LOG_DIR, Re
 
 APP_DIR = Path(__file__).resolve().parent
 WEB_DIR = APP_DIR / "web"
-HOST = "127.0.0.1"
+HOST = "0.0.0.0"
 PORT = 8765
 
 jobs = {}
@@ -309,6 +309,12 @@ def run_log_command(payload):
 def server_url(host, port):
     return f"http://{host}:{port}/"
 
+def server_display_url(host, port):
+    if host == "0.0.0.0":
+        return f"http://127.0.0.1:{port}/"
+    return f"http://{host}:{port}/"
+
+
 
 def existing_server_is_alive(host, port):
     try:
@@ -489,27 +495,28 @@ class ReleaseWebHandler(BaseHTTPRequestHandler):
 
 def main():
     parser = argparse.ArgumentParser(description="Release Harbor 发布港本地 Web 服务")
-    parser.add_argument("--host", default=HOST, help="监听地址，默认 127.0.0.1")
+    parser.add_argument("--host", default=HOST, help="监听地址，默认 0.0.0.0（所有接口）")
     parser.add_argument("--port", type=int, default=PORT, help="监听端口，默认 8765")
     parser.add_argument("--open-browser", action="store_true", help="启动后自动打开浏览器")
     args = parser.parse_args()
     url = server_url(args.host, args.port)
+    display = server_display_url(args.host, args.port)
     if args.open_browser and existing_server_is_alive(args.host, args.port):
-        print(f"Release Harbor 发布港已在运行: {url}")
-        webbrowser.open(url)
+        print(f"Release Harbor 发布港已在运行: {display}")
+        webbrowser.open(display)
         return 0
     try:
         server = ThreadingHTTPServer((args.host, args.port), ReleaseWebHandler)
     except OSError:
         if existing_server_is_alive(args.host, args.port):
-            print(f"Release Harbor 发布港已在运行: {url}")
+            print(f"Release Harbor 发布港已在运行: {display}")
             if args.open_browser:
-                webbrowser.open(url)
+                webbrowser.open(display)
             return 0
         raise
-    print(f"Release Harbor 发布港已启动: {url}")
+    print(f"Release Harbor 发布港已启动: {display}")
     if args.open_browser:
-        open_browser_later(url)
+        open_browser_later(display)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
@@ -519,5 +526,7 @@ def main():
     return 0
 
 
+
 if __name__ == "__main__":
     sys.exit(main())
+
