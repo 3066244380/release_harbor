@@ -1,5 +1,6 @@
 config.local.json
 logs/
+data/release_history.json
 .idea/
 *.log
 __pycache__/

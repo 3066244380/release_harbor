@@ -32,6 +32,7 @@
         "private_key": "C:\\Users\\Admin\\.ssh\\id_ed25519",
         "remote_dir": "/www/visa",
         "remote_filename": "visaV3.jar",
+        "backup_keep": 5,
         "ssh_path": "C:\\Windows\\System32\\OpenSSH\\ssh.exe",
         "scp_path": "C:\\Windows\\System32\\OpenSSH\\scp.exe"
       },
@@ -39,7 +40,11 @@
         "stop_command": "PID_FILE=\"{remote_dir}/app.pid\"\nPID=\"\"\nif [ -f \"$PID_FILE\" ]; then\n  PID=$(cat \"$PID_FILE\" 2>/dev/null || true)\nfi\nif [ -z \"$PID\" ] || ! ps -p \"$PID\" >/dev/null 2>&1; then\n  PID=$(pgrep -f \"{remote_process_pattern}\" | head -n 1 || true)\nfi\nif [ -n \"$PID\" ] && ps -p \"$PID\" >/dev/null 2>&1; then\n  kill -15 \"$PID\" 2>/dev/null || true\n  i=0\n  while [ $i -lt 60 ]; do\n    if ! ps -p \"$PID\" >/dev/null 2>&1; then\n      break\n    fi\n    sleep 1\n    i=$((i + 1))\n  done\n  kill -9 \"$PID\" 2>/dev/null || true\nfi\nrm -f \"$PID_FILE\"",
         "start_command": "nohup java -jar {remote_path} --spring.profiles.active={env} < /dev/null > {remote_dir}/nohup.out 2>&1 & echo $! > {remote_dir}/app.pid",
         "status_command": "PID_FILE=\"{remote_dir}/app.pid\"\nPID=\"\"\nif [ -f \"$PID_FILE\" ]; then\n  PID=$(cat \"$PID_FILE\" 2>/dev/null || true)\nfi\nif [ -n \"$PID\" ] && ps -p \"$PID\" >/dev/null 2>&1; then\n  ps -p \"$PID\" -o pid,etime,cmd\nelse\n  pgrep -af \"{remote_process_pattern}\" || echo no-process\nfi",
-        "startup_wait_seconds": 3
+        "startup_wait_seconds": 3,
+        "health_check_url": "",
+        "health_check_retries": 5,
+        "health_check_interval_seconds": 3,
+        "health_check_timeout_seconds": 5
       },
       "log": {
         "work_dir": "{remote_dir}"
@@ -94,5 +99,14 @@
       },
       "description": "签证业务后台 API 服务"
     }
-  ]
+  ],
+  "notification": {
+    "enabled": false,
+    "provider": "feishu",
+    "webhook_url": "",
+    "secret": "",
+    "notify_on_success": true,
+    "notify_on_failure": true,
+    "notify_on_cancelled": true
+  }
 }
