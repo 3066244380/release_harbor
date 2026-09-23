@@ -1,31 +1,39 @@
 import argparse
 import copy
+import base64
+import hashlib
+import hmac
 import json
 import mimetypes
 import os
 import subprocess
 import sys
 import threading
+import time
 import traceback
 import webbrowser
-from urllib.error import URLError
-from urllib.request import urlopen
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
 from dataclasses import dataclass, field
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import unquote, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
 import release_harbor
 from release_harbor import ConfigFile, EXAMPLE_CONFIG, LOCAL_CONFIG, LOG_DIR, ReleaseError
 
 APP_DIR = Path(__file__).resolve().parent
 WEB_DIR = APP_DIR / "web"
+DATA_DIR = APP_DIR / "data"
+HISTORY_FILE = DATA_DIR / "release_history.json"
+HISTORY_LIMIT = 500
 HOST = "0.0.0.0"
 PORT = 8765
 
 jobs = {}
 jobs_lock = threading.Lock()
+history_lock = threading.Lock()
 current_job_id = None
 
 
@@ -49,6 +57,10 @@ class Job:
     current_process: object | None = field(default=None, repr=False, compare=False)
     current_process_id: int | None = None
     created_at: str = field(default_factory=lambda: datetime.now().isoformat(timespec="seconds"))
+    started_at: str = ""
+    completed_at: str = ""
+    duration_seconds: float = 0
+    started_timestamp: float = field(default=0, repr=False, compare=False)
     updated_at: str = field(default_factory=lambda: datetime.now().isoformat(timespec="seconds"))
 
     def set_stage(self, key, title=None):
@@ -81,6 +93,9 @@ class Job:
             "cancel_requested": self.cancel_requested,
             "current_process_id": self.current_process_id,
             "created_at": self.created_at,
+            "started_at": self.started_at,
+            "completed_at": self.completed_at,
+            "duration_seconds": self.duration_seconds,
             "updated_at": self.updated_at,
         }
 
@@ -145,6 +160,217 @@ def cancel_job(job_id):
     if process:
         terminate_process(process)
     return job
+
+
+def mode_title(mode):
+    return {
+        "build": "只打包",
+        "deploy": "上传现有包",
+        "upload": "打包上传",
+        "start": "启动服务",
+        "full": "上传并启动",
+    }.get(mode, mode)
+
+
+def load_history_records():
+    if not HISTORY_FILE.exists():
+        return []
+    try:
+        data = json.loads(HISTORY_FILE.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return []
+    return data if isinstance(data, list) else []
+
+
+def save_history_records(records):
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    HISTORY_FILE.write_text(json.dumps(records[:HISTORY_LIMIT], ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def job_history_record(job):
+    return {
+        "id": job.id,
+        "project_name": job.project_name,
+        "env_name": job.env_name,
+        "mode": job.mode,
+        "mode_title": mode_title(job.mode),
+        "replica_names": job.replica_names or [],
+        "status": job.status,
+        "active_title": job.active_title,
+        "error": job.error,
+        "log_file": job.log_file,
+        "created_at": job.created_at,
+        "started_at": job.started_at,
+        "completed_at": job.completed_at,
+        "duration_seconds": round(float(job.duration_seconds or 0), 1),
+    }
+
+
+def append_history_record(record):
+    with history_lock:
+        records = load_history_records()
+        records = [item for item in records if item.get("id") != record.get("id")]
+        records.insert(0, record)
+        save_history_records(records)
+
+
+def list_history_records(query):
+    with history_lock:
+        records = load_history_records()
+    project_name = (query.get("project_name") or [""])[0].strip()
+    env_name = (query.get("env_name") or [""])[0].strip()
+    status = (query.get("status") or [""])[0].strip()
+    limit_text = (query.get("limit") or ["100"])[0]
+    try:
+        limit = max(1, min(int(limit_text), HISTORY_LIMIT))
+    except ValueError:
+        limit = 100
+    if project_name:
+        records = [item for item in records if item.get("project_name") == project_name]
+    if env_name:
+        records = [item for item in records if item.get("env_name") == env_name]
+    if status:
+        records = [item for item in records if item.get("status") == status]
+    return records[:limit]
+
+
+def read_history_log(record_id):
+    if not record_id:
+        raise ReleaseError("记录 ID 不能为空")
+    with history_lock:
+        records = load_history_records()
+    record = next((item for item in records if item.get("id") == record_id), None)
+    if not record:
+        raise ReleaseError("发布记录不存在")
+    log_file = str(record.get("log_file") or "").strip()
+    if not log_file:
+        return {"record": record, "content": ""}
+    path = Path(log_file).resolve()
+    log_root = LOG_DIR.resolve()
+    if path != log_root and log_root not in path.parents:
+        raise ReleaseError("只能读取发布日志目录内的文件")
+    if not path.exists():
+        return {"record": record, "content": "", "missing": True}
+    return {"record": record, "content": path.read_text(encoding="utf-8", errors="replace")}
+
+
+def notification_config(data):
+    config = data.get("notification") if isinstance(data, dict) else None
+    return config if isinstance(config, dict) else {}
+
+
+def notification_enabled_for_status(config, status):
+    if not config.get("enabled"):
+        return False
+    if status == "success":
+        return bool(config.get("notify_on_success"))
+    if status == "failed":
+        return bool(config.get("notify_on_failure"))
+    if status == "cancelled":
+        return bool(config.get("notify_on_cancelled"))
+    return False
+
+
+def feishu_sign(secret, timestamp):
+    string_to_sign = f"{timestamp}\n{secret}"
+    digest = hmac.new(string_to_sign.encode("utf-8"), digestmod=hashlib.sha256).digest()
+    return base64.b64encode(digest).decode("utf-8")
+
+
+def post_json(url, payload, timeout=10):
+    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    request = Request(url, data=body, headers={"Content-Type": "application/json; charset=utf-8"}, method="POST")
+    try:
+        with urlopen(request, timeout=timeout) as response:
+            text = response.read().decode("utf-8", errors="replace")
+    except HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        raise ReleaseError(f"通知发送失败，HTTP {exc.code}: {detail}") from exc
+    except URLError as exc:
+        raise ReleaseError(f"通知发送失败: {exc}") from exc
+    try:
+        return json.loads(text) if text else {}
+    except json.JSONDecodeError:
+        return {"raw": text}
+
+
+def send_feishu_notification(config, text):
+    webhook_url = str(config.get("webhook_url") or "").strip()
+    if not webhook_url:
+        raise ReleaseError("飞书 Webhook 地址不能为空")
+    payload = {
+        "msg_type": "text",
+        "content": {"text": text},
+    }
+    secret = str(config.get("secret") or "").strip()
+    if secret:
+        timestamp = str(int(time.time()))
+        payload["timestamp"] = timestamp
+        payload["sign"] = feishu_sign(secret, timestamp)
+    result = post_json(webhook_url, payload)
+    code = result.get("StatusCode", result.get("code", 0))
+    if code not in (0, "0", None):
+        message = result.get("StatusMessage") or result.get("msg") or result.get("message") or result
+        raise ReleaseError(f"飞书通知返回失败: {message}")
+    return result
+
+
+def build_notification_text(record, title="Release Harbor 发布通知"):
+    status_text = {
+        "success": "成功",
+        "failed": "失败",
+        "cancelled": "已停止",
+    }.get(record.get("status"), record.get("status") or "-")
+    replicas = record.get("replica_names") or []
+    lines = [
+        title,
+        f"状态: {status_text}",
+        f"项目: {record.get('project_name') or '-'}",
+        f"环境: {record.get('env_name') or '-'}",
+        f"动作: {record.get('mode_title') or record.get('mode') or '-'}",
+        f"副本: {', '.join(replicas) if replicas else '默认目标'}",
+        f"耗时: {record.get('duration_seconds') or 0}s",
+        f"完成时间: {record.get('completed_at') or '-'}",
+        f"日志: {record.get('log_file') or '-'}",
+    ]
+    if record.get("error"):
+        lines.append(f"错误: {record.get('error')}")
+    return "\n".join(lines)
+
+
+def send_notification(config, text):
+    provider = str(config.get("provider") or "feishu").strip()
+    if provider != "feishu":
+        raise ReleaseError(f"暂不支持的通知渠道: {provider}")
+    return send_feishu_notification(config, text)
+
+
+def notify_job_finished(config_file, record, logger=None):
+    config = notification_config(config_file.data)
+    if not notification_enabled_for_status(config, record.get("status")):
+        return
+    try:
+        send_notification(config, build_notification_text(record))
+        if logger:
+            logger.write("飞书通知已发送")
+    except Exception as exc:
+        if logger:
+            logger.write(f"飞书通知发送失败: {exc}")
+
+
+def send_test_notification(payload):
+    data = payload_to_config(payload) if "config" in payload or "projects" in payload else load_public_config()[1]
+    config = notification_config(data)
+    if not config.get("webhook_url"):
+        raise ReleaseError("请先填写飞书 Webhook 地址")
+    text = "\n".join([
+        "Release Harbor 测试通知",
+        "状态: 测试",
+        "说明: 如果你能看到这条消息，说明飞书机器人配置可用。",
+        f"发送时间: {datetime.now().isoformat(timespec='seconds')}",
+    ])
+    result = send_notification(config, text)
+    return {"message": "测试通知已发送", "result": result}
 
 
 def read_request_json(handler):
@@ -217,7 +443,10 @@ def payload_to_config(payload):
         data = data["state"]
     if "projects" not in data:
         raise ReleaseError("配置缺少 projects")
-    return sanitize_config({"projects": data.get("projects")})
+    clean = {"projects": data.get("projects")}
+    if isinstance(data.get("notification"), dict):
+        clean["notification"] = data.get("notification")
+    return sanitize_config(clean)
 
 
 def merged_config_for_validation(data):
@@ -306,6 +535,77 @@ def run_log_command(payload):
     )
 
 
+def resolve_single_deploy_target(payload):
+    project_name = str(payload.get("project_name") or "").strip()
+    env_name = str(payload.get("env_name") or "").strip()
+    replica_name = str(payload.get("replica_name") or "").strip()
+    if not project_name:
+        raise ReleaseError("project_name 不能为空")
+    if not env_name:
+        raise ReleaseError("env_name 不能为空")
+
+    data = payload_to_config(payload) if "config" in payload or "projects" in payload else load_public_config()[1]
+    config_file = merged_config_for_validation(data)
+    projects = {item.get("name"): item for item in config_file.data.get("projects", []) or []}
+    project = projects.get(project_name)
+    if not project:
+        raise ReleaseError(f"找不到项目: {project_name}")
+
+    replicas = release_harbor.get_project_replicas(project, env_name)
+    if replicas and not replica_name:
+        raise ReleaseError("请选择副本")
+    target_configs = release_harbor.get_deploy_targets(
+        project,
+        config_file.data,
+        env_name,
+        [replica_name] if replica_name else None,
+        require_selection=bool(replicas),
+    )
+    target_config = target_configs[0] if target_configs else None
+    return config_file, project, env_name, target_config
+
+
+def list_backups(payload):
+    config_file, project, env_name, target_config = resolve_single_deploy_target(payload)
+    return release_harbor.list_remote_backups(config_file, project, env_name=env_name, target_config=target_config)
+
+
+def rollback_backup(payload):
+    backup_path = str(payload.get("backup_path") or payload.get("backup_name") or "").strip()
+    restart = bool(payload.get("restart"))
+    if not backup_path:
+        raise ReleaseError("backup_path 不能为空")
+    config_file, project, env_name, target_config = resolve_single_deploy_target(payload)
+    logger = release_harbor.Logger() if restart else None
+    return release_harbor.rollback_remote_backup(
+        config_file,
+        project,
+        backup_path,
+        env_name=env_name,
+        target_config=target_config,
+        restart=restart,
+        logger=logger,
+    )
+
+
+def run_preflight(payload):
+    project_name = str(payload.get("project_name") or "").strip()
+    env_name = str(payload.get("env_name") or "").strip()
+    replica_names = parse_replica_names(payload)
+    if not project_name:
+        raise ReleaseError("project_name 不能为空")
+    if not env_name:
+        raise ReleaseError("env_name 不能为空")
+
+    data = payload_to_config(payload) if "config" in payload or "projects" in payload else load_public_config()[1]
+    config_file = merged_config_for_validation(data)
+    projects = {item.get("name"): item for item in config_file.data.get("projects", []) or []}
+    project = projects.get(project_name)
+    if not project:
+        raise ReleaseError(f"找不到项目: {project_name}")
+    return release_harbor.run_preflight_checks(config_file, project, env_name=env_name, replica_names=replica_names)
+
+
 def server_url(host, port):
     return f"http://{host}:{port}/"
 
@@ -373,8 +673,11 @@ def run_job(job_id):
     with jobs_lock:
         job = jobs[job_id]
         job.status = "running"
+        job.started_at = datetime.now().isoformat(timespec="seconds")
+        job.started_timestamp = time.time()
         job.set_stage("validate", "校验配置")
     logger = JobLogger(job)
+    config_file = None
     try:
         logger.write(f"日志文件: {logger.path}")
         config_file = release_harbor.load_config()
@@ -392,11 +695,20 @@ def run_job(job_id):
                 job.status = "failed"
                 job.error = str(exc)
     finally:
+        history_record = None
         with jobs_lock:
             job.current_process = None
             job.current_process_id = None
+            job.completed_at = datetime.now().isoformat(timespec="seconds")
+            if job.started_timestamp:
+                job.duration_seconds = time.time() - job.started_timestamp
             if current_job_id == job_id:
                 current_job_id = None
+            history_record = job_history_record(job)
+        if history_record:
+            append_history_record(history_record)
+            if config_file:
+                notify_job_finished(config_file, history_record, logger)
 
 
 class ReleaseWebHandler(BaseHTTPRequestHandler):
@@ -405,10 +717,19 @@ class ReleaseWebHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         parsed = urlparse(self.path)
         path = parsed.path
+        query = parse_qs(parsed.query)
         try:
             if path == "/api/config":
                 source, data = load_public_config()
                 send_json(self, {"ok": True, "source": str(source), "config": data})
+                return
+            if path == "/api/history":
+                records = list_history_records(query)
+                send_json(self, {"ok": True, "records": records})
+                return
+            if path == "/api/history/log":
+                result = read_history_log((query.get("id") or [""])[0])
+                send_json(self, {"ok": True, "result": result})
                 return
             if path.startswith("/api/jobs/"):
                 job_id = path.rsplit("/", 1)[-1]
@@ -458,6 +779,22 @@ class ReleaseWebHandler(BaseHTTPRequestHandler):
                 return
             if path == "/api/logs/command":
                 result = run_log_command(payload)
+                send_json(self, {"ok": True, "result": result})
+                return
+            if path == "/api/backups/list":
+                result = list_backups(payload)
+                send_json(self, {"ok": True, "result": result})
+                return
+            if path == "/api/backups/rollback":
+                result = rollback_backup(payload)
+                send_json(self, {"ok": True, "result": result})
+                return
+            if path == "/api/preflight":
+                result = run_preflight(payload)
+                send_json(self, {"ok": True, "result": result})
+                return
+            if path == "/api/notifications/test":
+                result = send_test_notification(payload)
                 send_json(self, {"ok": True, "result": result})
                 return
             send_error_json(self, "接口不存在", status=404)
